@@ -3,12 +3,12 @@ set -Eeuo pipefail
 
 # Rosie Krea2 LoRA training launcher
 # Usage:
-#   ./run_rosie_training.sh [extra train_lora args...]
+#   ./run_training.sh [extra train_lora args...]
 #
 # Useful overrides:
-#   MAX_TRAIN_EPOCHS=20 SAVE_EVERY_N_EPOCHS=1 ./run_rosie_training.sh
-#   RUN_CACHE_LATENTS=1 RUN_CACHE_TEXT=1 ./run_rosie_training.sh
-#   OUTPUT_NAME=rosie_test MAX_TRAIN_STEPS=100 ./run_rosie_training.sh --learning_rate 8e-5
+#   MAX_TRAIN_EPOCHS=20 SAVE_EVERY_N_EPOCHS=1 ./run_training.sh
+#   RUN_CACHE_LATENTS=1 RUN_CACHE_TEXT=1 ./run_training.sh
+#   OUTPUT_NAME=rosie_test MAX_TRAIN_STEPS=100 ./run_training.sh --learning_rate 8e-5
 
 PROJECT_DIR="${PROJECT_DIR:-/home/hina/Workspace/krea2-trainer}"
 DATASET_CONFIG="${DATASET_CONFIG:-${PROJECT_DIR}/configs/asian.toml}"
