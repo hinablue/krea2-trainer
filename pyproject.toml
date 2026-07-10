@@ -1,0 +1,74 @@
+[project]
+name = "krea2-trainer"
+version = "0.1.0"
+description = "Standalone Krea 2 LoRA trainer extracted from musubi-tuner"
+readme = "README.md"
+requires-python = ">=3.10, <3.13"
+dependencies = [
+    "accelerate==1.6.0",
+    "adv_optm>=2.5.12",
+    "av==14.0.1",
+    "bitsandbytes",
+    "diffusers==0.32.1",
+    "einops==0.7.0",
+    "huggingface-hub==0.34.3",
+    "opencv-python==4.10.0.84",
+    "pillow>=11.3.0",
+    "safetensors==0.4.5",
+    "toml==0.10.2",
+    "tqdm==4.67.1",
+    "transformers==4.57.6",
+    "voluptuous==0.15.2",
+    "torchvision>=0.20.1",
+]
+
+[project.optional-dependencies]
+cu124 = ["torch>=2.5.1", "torchvision>=0.20.1"]
+cu128 = ["torch>=2.7.1", "torchvision>=0.22.1"]
+cu130 = ["torch>=2.9.1", "torchvision>=0.24.1"]
+tracking = ["wandb>=0.17.0"]
+dev = ["ruff>=0.12.10"]
+
+[project.scripts]
+krea2-train-lora = "krea2_trainer.scripts.train_lora:main"
+krea2-cache-latents = "krea2_trainer.scripts.cache_latents:main"
+krea2-cache-text = "krea2_trainer.scripts.cache_text_encoder:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+conflicts = [[{ extra = "cu124" }, { extra = "cu128" }, { extra = "cu130" }]]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu124", extra = "cu124" },
+  { index = "pytorch-cu128", extra = "cu128" },
+  { index = "pytorch-cu130", extra = "cu130" },
+]
+torchvision = [
+  { index = "pytorch-cu124", extra = "cu124" },
+  { index = "pytorch-cu128", extra = "cu128" },
+  { index = "pytorch-cu130", extra = "cu130" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.ruff]
+line-length = 132
+target-version = "py310"
+lint.ignore = ["E402", "E712", "E721", "E722", "E731", "E741", "F401", "F841"]
