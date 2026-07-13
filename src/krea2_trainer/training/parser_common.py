@@ -480,6 +480,11 @@ def _add_timestep_args(parser: argparse.ArgumentParser) -> None:
         help="Maximum TQD Beta concentration for samples with strongly imbalanced structure/detail scores.",
     )
     parser.add_argument(
+        "--tqd_quality_weighting",
+        action="store_true",
+        help="Apply mean-one per-sample quality weights max(structure_score, detail_score), approximating TQD sample retention without changing batch cardinality.",
+    )
+    parser.add_argument(
         "--weighting_scheme",
         type=str,
         default="none",

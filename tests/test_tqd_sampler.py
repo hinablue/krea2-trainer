@@ -6,7 +6,7 @@ import torch
 
 from krea2_trainer.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from krea2_trainer.training.parser_common import _add_timestep_args
-from krea2_trainer.training.timesteps import sample_structure_detail_tqd
+from krea2_trainer.training.timesteps import normalized_tqd_quality_weights, sample_structure_detail_tqd
 from krea2_trainer.training.trainer_base import NetworkTrainer
 
 
@@ -57,6 +57,12 @@ class StructureDetailTQDSamplerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "kappa_base"):
             sample_structure_detail_tqd(scores, scores, kappa_base=0.0, kappa_max=8.0, sigmoid_scale=1.0)
 
+    def test_quality_weights_are_mean_one_and_downweight_low_quality_samples(self):
+        weights = normalized_tqd_quality_weights(torch.tensor([0.9, 0.2]), torch.tensor([0.1, 0.3]))
+
+        torch.testing.assert_close(weights.mean(), torch.tensor(1.0))
+        self.assertGreater(weights[0].item(), weights[1].item())
+
     def test_trainer_routes_structure_dominant_samples_to_higher_noise(self):
         trainer = NetworkTrainer()
         scheduler = FlowMatchDiscreteScheduler(shift=1.0, reverse=True, solver="euler")
@@ -105,11 +111,22 @@ class StructureDetailTQDSamplerTests(unittest.TestCase):
     def test_parser_accepts_tqd_mode_and_parameters(self):
         parser = argparse.ArgumentParser()
         _add_timestep_args(parser)
-        args = parser.parse_args(["--timestep_sampling", "tqd_krea2_shift", "--tqd_kappa_base", "3", "--tqd_kappa_max", "9"])
+        args = parser.parse_args(
+            [
+                "--timestep_sampling",
+                "tqd_krea2_shift",
+                "--tqd_kappa_base",
+                "3",
+                "--tqd_kappa_max",
+                "9",
+                "--tqd_quality_weighting",
+            ]
+        )
 
         self.assertEqual(args.timestep_sampling, "tqd_krea2_shift")
         self.assertEqual(args.tqd_kappa_base, 3.0)
         self.assertEqual(args.tqd_kappa_max, 9.0)
+        self.assertTrue(args.tqd_quality_weighting)
 
 
 if __name__ == "__main__":

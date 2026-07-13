@@ -63,6 +63,7 @@ from krea2_trainer.training.timesteps import (
     compute_ideogram4_shift_timestep,
     compute_loss_weighting_for_sd3,
     get_sigmas,
+    normalized_tqd_quality_weights,
     sample_structure_detail_tqd,
 )
 
@@ -1263,7 +1264,17 @@ class NetworkTrainer:
         )
 
         output = self.call_dit(args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype)
-        loss, loss_metrics = self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
+        sample_weights = None
+        if args.tqd_quality_weighting:
+            if "tqd_structure_score" not in batch or "tqd_detail_score" not in batch:
+                raise ValueError("tqd_quality_weighting requires TQD structure/detail scores in every training batch")
+            sample_weights = normalized_tqd_quality_weights(
+                batch["tqd_structure_score"].to(device=accelerator.device),
+                batch["tqd_detail_score"].to(device=accelerator.device),
+            )
+        loss, loss_metrics = self.compute_loss(
+            args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step, sample_weights=sample_weights
+        )
         if args.timestep_sampling == "tqd_krea2_shift":
             structure = batch["tqd_structure_score"].to(device=accelerator.device, dtype=torch.float32)
             detail = batch["tqd_detail_score"].to(device=accelerator.device, dtype=torch.float32)
@@ -1288,6 +1299,7 @@ class NetworkTrainer:
         dit_dtype: torch.dtype,
         network_dtype: torch.dtype,
         global_step: int,
+        sample_weights: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Reduce a ``DiTOutput`` to a scalar loss + per-step metrics dict.
 
@@ -1308,6 +1320,10 @@ class NetworkTrainer:
         loss = torch.nn.functional.mse_loss(output.pred.to(network_dtype), output.target, reduction="none")
         if weighting is not None:
             loss = loss * weighting
+        if sample_weights is not None:
+            if sample_weights.ndim != 1 or sample_weights.shape[0] != loss.shape[0]:
+                raise ValueError("TQD sample_weights must have shape [batch_size]")
+            loss = loss * sample_weights.to(device=loss.device, dtype=loss.dtype).view(-1, *([1] * (loss.ndim - 1)))
         return loss.mean(), {}
 
     def on_transformer_loaded(

@@ -34,6 +34,20 @@ def compute_ideogram4_shift_timestep(
     return t.clamp(1.0 - t_max, 1.0 - t_min).to(dtype=uniform_samples.dtype)
 
 
+def normalized_tqd_quality_weights(structure_scores: torch.Tensor, detail_scores: torch.Tensor) -> torch.Tensor:
+    """Return mean-one deterministic weights approximating TQD sample retention."""
+    if structure_scores.shape != detail_scores.shape:
+        raise ValueError("TQD structure and detail score tensors must have matching shapes")
+
+    structure = structure_scores.to(dtype=torch.float32)
+    detail = detail_scores.to(device=structure.device, dtype=torch.float32)
+    if torch.any((structure < 0.0) | (structure > 1.0) | (detail < 0.0) | (detail > 1.0)):
+        raise ValueError("TQD structure and detail scores must be within [0, 1]")
+
+    quality = torch.maximum(structure, detail)
+    return quality / quality.mean().clamp_min(torch.finfo(quality.dtype).eps)
+
+
 def sample_structure_detail_tqd(
     structure_scores: torch.Tensor,
     detail_scores: torch.Tensor,
