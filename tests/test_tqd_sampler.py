@@ -7,7 +7,7 @@ import torch
 from krea2_trainer.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from krea2_trainer.training.parser_common import _add_timestep_args
 from krea2_trainer.training.timesteps import normalized_tqd_quality_weights, sample_structure_detail_tqd
-from krea2_trainer.training.trainer_base import NetworkTrainer
+from krea2_trainer.training.trainer_base import DiTOutput, NetworkTrainer
 
 
 class StructureDetailTQDSamplerTests(unittest.TestCase):
@@ -64,6 +64,71 @@ class StructureDetailTQDSamplerTests(unittest.TestCase):
         self.assertGreater(weights[0].item(), weights[1].item())
         with self.assertRaisesRegex(ValueError, "at least one non-zero"):
             normalized_tqd_quality_weights(torch.zeros(2), torch.zeros(2))
+
+    def test_tqd_mode_rejects_missing_scores_and_bucketed_timesteps(self):
+        trainer = NetworkTrainer()
+        scheduler = FlowMatchDiscreteScheduler(shift=1.0, reverse=True, solver="euler")
+        args = argparse.Namespace(
+            timestep_sampling="tqd_krea2_shift",
+            tqd_kappa_base=2.0,
+            tqd_kappa_max=8.0,
+            sigmoid_scale=1.0,
+            min_timestep=None,
+            max_timestep=None,
+            preserve_distribution_shape=False,
+        )
+        latents = torch.zeros(2, 1, 2, 2)
+        noise = torch.ones_like(latents)
+
+        with self.assertRaisesRegex(ValueError, "requires tqd_structure_score"):
+            trainer.get_noisy_model_input_and_timesteps(
+                args, noise, latents, None, scheduler, torch.device("cpu"), torch.float32
+            )
+
+        with self.assertRaisesRegex(ValueError, "incompatible with num_timestep_buckets"):
+            trainer.get_noisy_model_input_and_timesteps(
+                args,
+                noise,
+                latents,
+                [1.0, 2.0],
+                scheduler,
+                torch.device("cpu"),
+                torch.float32,
+                tqd_structure_scores=torch.full((2,), 0.5),
+                tqd_detail_scores=torch.full((2,), 0.5),
+            )
+
+    def test_quality_weights_change_compute_loss_without_changing_uniform_loss_scale(self):
+        trainer = NetworkTrainer()
+        args = argparse.Namespace(weighting_scheme="none")
+        output = DiTOutput(pred=torch.tensor([[2.0], [1.0]]), target=torch.zeros(2, 1))
+        timesteps = torch.ones(2)
+
+        unweighted_loss, _ = trainer.compute_loss(args, output, timesteps, None, torch.float32, torch.float32, 0)
+        weighted_loss, _ = trainer.compute_loss(
+            args,
+            output,
+            timesteps,
+            None,
+            torch.float32,
+            torch.float32,
+            0,
+            sample_weights=torch.tensor([1.5, 0.5]),
+        )
+        uniform_loss, _ = trainer.compute_loss(
+            args,
+            output,
+            timesteps,
+            None,
+            torch.float32,
+            torch.float32,
+            0,
+            sample_weights=torch.ones(2),
+        )
+
+        torch.testing.assert_close(unweighted_loss, torch.tensor(2.5))
+        torch.testing.assert_close(weighted_loss, torch.tensor(3.25))
+        torch.testing.assert_close(uniform_loss, unweighted_loss)
 
     def test_trainer_routes_structure_dominant_samples_to_higher_noise(self):
         trainer = NetworkTrainer()
