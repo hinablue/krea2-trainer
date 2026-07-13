@@ -45,7 +45,10 @@ def normalized_tqd_quality_weights(structure_scores: torch.Tensor, detail_scores
         raise ValueError("TQD structure and detail scores must be within [0, 1]")
 
     quality = torch.maximum(structure, detail)
-    return quality / quality.mean().clamp_min(torch.finfo(quality.dtype).eps)
+    mean_quality = quality.mean()
+    if mean_quality <= torch.finfo(quality.dtype).eps:
+        raise ValueError("TQD quality weights require at least one non-zero structure or detail score per batch")
+    return quality / mean_quality
 
 
 def sample_structure_detail_tqd(

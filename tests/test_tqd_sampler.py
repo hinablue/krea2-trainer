@@ -62,6 +62,8 @@ class StructureDetailTQDSamplerTests(unittest.TestCase):
 
         torch.testing.assert_close(weights.mean(), torch.tensor(1.0))
         self.assertGreater(weights[0].item(), weights[1].item())
+        with self.assertRaisesRegex(ValueError, "at least one non-zero"):
+            normalized_tqd_quality_weights(torch.zeros(2), torch.zeros(2))
 
     def test_trainer_routes_structure_dominant_samples_to_higher_noise(self):
         trainer = NetworkTrainer()
