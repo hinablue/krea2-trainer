@@ -63,6 +63,7 @@ from krea2_trainer.training.timesteps import (
     compute_ideogram4_shift_timestep,
     compute_loss_weighting_for_sd3,
     get_sigmas,
+    sample_structure_detail_tqd,
 )
 
 logger = logging.getLogger(__name__)
@@ -584,6 +585,8 @@ class NetworkTrainer:
         noise_scheduler: FlowMatchDiscreteScheduler,
         device: torch.device,
         dtype: torch.dtype,
+        tqd_structure_scores: Optional[torch.Tensor] = None,
+        tqd_detail_scores: Optional[torch.Tensor] = None,
     ):
         batch_size = noise.shape[0]
 
@@ -634,6 +637,7 @@ class NetworkTrainer:
             or args.timestep_sampling == "qinglong_flux"
             or args.timestep_sampling == "qinglong_qwen"
             or args.timestep_sampling == "flux2_shift"
+            or args.timestep_sampling == "tqd_krea2_shift"
         ):
 
             def compute_sampling_timesteps(org_timesteps: Optional[torch.Tensor]) -> torch.Tensor:
@@ -660,6 +664,26 @@ class NetworkTrainer:
                         t = torch.sigmoid(args.sigmoid_scale * randn(batch_size, org_timesteps))
                     else:
                         t = rand(batch_size, org_timesteps)
+
+                elif args.timestep_sampling == "tqd_krea2_shift":
+                    if tqd_structure_scores is None or tqd_detail_scores is None:
+                        raise ValueError(
+                            "tqd_krea2_shift requires tqd_structure_score and tqd_detail_score in every training batch"
+                        )
+                    if org_timesteps is not None:
+                        raise ValueError("tqd_krea2_shift is incompatible with num_timestep_buckets")
+
+                    t = sample_structure_detail_tqd(
+                        tqd_structure_scores.to(device=device),
+                        tqd_detail_scores.to(device=device),
+                        kappa_base=args.tqd_kappa_base,
+                        kappa_max=args.tqd_kappa_max,
+                        sigmoid_scale=args.sigmoid_scale,
+                    )
+                    h, w = latents.shape[-2:]
+                    mu = train_utils.get_lin_function(x1=256, y1=0.5, x2=6400, y2=1.15)((h // 2) * (w // 2))
+                    shift = math.exp(mu)
+                    t = (t * shift) / (1 + (shift - 1) * t)
 
                 elif args.timestep_sampling == "ideogram4_shift":
                     h, w = latents.shape[-2:]
@@ -1227,11 +1251,33 @@ class NetworkTrainer:
         ``latents`` is already scale-shifted; ``noise`` is already sampled.
         """
         noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
-            args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
+            args,
+            noise,
+            latents,
+            batch["timesteps"],
+            noise_scheduler,
+            accelerator.device,
+            dit_dtype,
+            tqd_structure_scores=batch.get("tqd_structure_score"),
+            tqd_detail_scores=batch.get("tqd_detail_score"),
         )
 
         output = self.call_dit(args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype)
-        return self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
+        loss, loss_metrics = self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
+        if args.timestep_sampling == "tqd_krea2_shift":
+            structure = batch["tqd_structure_score"].to(device=accelerator.device, dtype=torch.float32)
+            detail = batch["tqd_detail_score"].to(device=accelerator.device, dtype=torch.float32)
+            sampled_t = torch.as_tensor(timesteps, device=accelerator.device, dtype=torch.float32)
+            sampled_t = (sampled_t - 1.0) / 1000.0
+            loss_metrics.update(
+                {
+                    "tqd/structure_mean": structure.mean().item(),
+                    "tqd/detail_mean": detail.mean().item(),
+                    "tqd/timestep_mean": sampled_t.mean().item(),
+                    "tqd/timestep_std": sampled_t.std(unbiased=False).item(),
+                }
+            )
+        return loss, loss_metrics
 
     def compute_loss(
         self,

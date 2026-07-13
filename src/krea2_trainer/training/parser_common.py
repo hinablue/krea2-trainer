@@ -446,6 +446,7 @@ def _add_timestep_args(parser: argparse.ArgumentParser) -> None:
             "ideogram4_shift",
             "qwen_shift",
             "krea2_shift",
+            "tqd_krea2_shift",
             "logsnr",
             "qinglong_flux",
             "qinglong_qwen",
@@ -465,6 +466,18 @@ def _add_timestep_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=1.0,
         help='Scale factor for sigmoid timestep sampling (only used when timestep-sampling is "sigmoid" or "shift"). / sigmoidタイムステップサンプリングの倍率（timestep-samplingが"sigmoid"または"shift"の場合のみ有効）。',
+    )
+    parser.add_argument(
+        "--tqd_kappa_base",
+        type=float,
+        default=2.0,
+        help="Base TQD Beta concentration. With equal structure/detail scores, 2.0 preserves Krea2's native logit-normal distribution.",
+    )
+    parser.add_argument(
+        "--tqd_kappa_max",
+        type=float,
+        default=8.0,
+        help="Maximum TQD Beta concentration for samples with strongly imbalanced structure/detail scores.",
     )
     parser.add_argument(
         "--weighting_scheme",

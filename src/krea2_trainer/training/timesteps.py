@@ -34,6 +34,50 @@ def compute_ideogram4_shift_timestep(
     return t.clamp(1.0 - t_max, 1.0 - t_min).to(dtype=uniform_samples.dtype)
 
 
+def sample_structure_detail_tqd(
+    structure_scores: torch.Tensor,
+    detail_scores: torch.Tensor,
+    *,
+    kappa_base: float,
+    kappa_max: float,
+    sigmoid_scale: float,
+    cdf_samples: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sample Krea2's pre-shift timestep from per-sample structure/detail scores.
+
+    The Beta draw happens in CDF space. When scores are equal and
+    ``kappa_base == 2``, it is uniform; applying the inverse normal CDF then
+    reproduces Krea2's native logit-normal sample before resolution shifting.
+    """
+    if structure_scores.shape != detail_scores.shape:
+        raise ValueError("TQD structure and detail score tensors must have matching shapes")
+    if kappa_base <= 0.0 or kappa_max < kappa_base:
+        raise ValueError("TQD requires kappa_base > 0 and kappa_max >= kappa_base")
+
+    structure = structure_scores.to(dtype=torch.float32)
+    detail = detail_scores.to(device=structure.device, dtype=torch.float32)
+    if torch.any((structure < 0.0) | (structure > 1.0) | (detail < 0.0) | (detail > 1.0)):
+        raise ValueError("TQD structure and detail scores must be within [0, 1]")
+
+    mu = 0.5 + 0.5 * (structure - detail)
+    quality_gap = (structure - detail).abs()
+    kappa = kappa_base + (kappa_max - kappa_base) * quality_gap
+
+    if cdf_samples is None:
+        alpha = (mu * kappa).clamp_min(1e-4)
+        beta = ((1.0 - mu) * kappa).clamp_min(1e-4)
+        cdf_samples = torch.distributions.Beta(alpha, beta).sample()
+    else:
+        if cdf_samples.shape != structure.shape:
+            raise ValueError("TQD CDF samples must match the score tensor shape")
+
+    assert cdf_samples is not None
+    eps = torch.finfo(structure.dtype).eps
+    u = cdf_samples.to(device=structure.device, dtype=structure.dtype).clamp(eps, 1.0 - eps)
+    z = math.sqrt(2.0) * torch.erfinv(2.0 * u - 1.0)
+    return torch.sigmoid(sigmoid_scale * z)
+
+
 def compute_density_for_timestep_sampling(
     weighting_scheme: str, batch_size: int, logit_mean: float = None, logit_std: float = None, mode_scale: float = None
 ):
