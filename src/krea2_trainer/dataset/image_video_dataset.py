@@ -129,6 +129,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self.cache_directory = cache_directory
         self.debug_dataset = debug_dataset
         self.architecture = architecture
+        self.tqd_score_file = tqd_score_file
         self.tqd_scores = self._load_tqd_scores(tqd_score_file)
         self.seed = None
         self.current_epoch = 0
@@ -172,6 +173,17 @@ class BaseDataset(torch.utils.data.Dataset):
 
         logger.info("Loaded %d TQD score records from %s", len(scores), score_path)
         return scores
+
+    def attach_tqd_scores(self, item_info: ItemInfo, cache_file: str) -> None:
+        """Attach required TQD scores to one training cache item when configured."""
+        if self.tqd_score_file is None:
+            return
+
+        cache_name = os.path.basename(cache_file)
+        try:
+            item_info.tqd_structure_score, item_info.tqd_detail_score = self.tqd_scores[cache_name]
+        except KeyError as exc:
+            raise ValueError(f"Missing TQD score for training cache: {cache_name}") from exc
 
     def get_metadata(self) -> dict:
         metadata = {
@@ -591,13 +603,7 @@ class ImageDataset(BaseDataset):
 
             item_info = ItemInfo(item_key, "", image_size, bucket_reso, latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
-
-            if self.tqd_scores:
-                cache_name = os.path.basename(cache_file)
-                try:
-                    item_info.tqd_structure_score, item_info.tqd_detail_score = self.tqd_scores[cache_name]
-                except KeyError as exc:
-                    raise ValueError(f"Missing TQD score for training cache: {cache_name}") from exc
+            self.attach_tqd_scores(item_info, cache_file)
 
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):
@@ -934,6 +940,7 @@ class VideoDataset(BaseDataset):
             bucket_reso = (*bucket_reso, frame_count)
             item_info = ItemInfo(item_key, "", image_size, bucket_reso, frame_count=frame_count, latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
+            self.attach_tqd_scores(item_info, cache_file)
 
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):

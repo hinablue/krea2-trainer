@@ -7,6 +7,7 @@ import torch
 from safetensors.torch import save_file
 
 from krea2_trainer.dataset.bucket import BucketBatchManager
+from krea2_trainer.dataset.config_utils import ConfigSanitizer
 from krea2_trainer.dataset.image_video_dataset import BaseDataset, ItemInfo
 
 
@@ -47,6 +48,48 @@ class TQDScoreManifestTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "within \\[0, 1\\]"):
                 BaseDataset._load_tqd_scores(str(invalid))
+
+    def test_rejects_malformed_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            malformed = self.write_manifest(Path(tmp), [{"cache_file": "sample.safetensors", "structure_score": 0.5}])
+            with self.assertRaisesRegex(ValueError, "Invalid TQD score record"):
+                BaseDataset._load_tqd_scores(str(malformed))
+
+    def test_score_file_requires_every_training_cache_even_when_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.write_manifest(Path(tmp), [])
+            dataset = BaseDataset((1024, 1024), None, 1, 1, False, False, tqd_score_file=str(manifest))
+            cache_file = "/tmp/sample.safetensors"
+            item = ItemInfo("sample", "", (1024, 1024), (1024, 1024), latent_cache_path=cache_file)
+
+            with self.assertRaisesRegex(ValueError, "Missing TQD score"):
+                dataset.attach_tqd_scores(item, cache_file)
+
+    def test_no_score_file_leaves_items_unscored(self):
+        dataset = BaseDataset((1024, 1024), None, 1, 1, False, False)
+        cache_file = "/tmp/sample.safetensors"
+        item = ItemInfo("sample", "", (1024, 1024), (1024, 1024), latent_cache_path=cache_file)
+
+        dataset.attach_tqd_scores(item, cache_file)
+
+        self.assertIsNone(item.tqd_structure_score)
+        self.assertIsNone(item.tqd_detail_score)
+
+    def test_dataset_config_accepts_score_file(self):
+        config = {
+            "general": {},
+            "datasets": [
+                {
+                    "image_directory": "/tmp/images",
+                    "cache_directory": "/tmp/cache",
+                    "resolution": [1024, 1024],
+                    "batch_size": 1,
+                    "enable_bucket": True,
+                    "tqd_score_file": "/tmp/scores.jsonl",
+                }
+            ],
+        }
+        ConfigSanitizer().sanitize_user_config(config)
 
 
 class TQDBatchPropagationTests(unittest.TestCase):
