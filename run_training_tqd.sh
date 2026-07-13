@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Rosie Krea2 LoRA training launcher
+# Rosie Krea2 LoRA training launcher (TQD Version)
 # Usage:
-#   ./run_training.sh [extra train_lora args...]
+#   ./run_training_tqd.sh [extra train_lora args...]
 #
-# Useful overrides:
-#   MAX_TRAIN_EPOCHS=20 SAVE_EVERY_N_EPOCHS=1 ./run_training.sh
-#   RUN_CACHE_LATENTS=1 RUN_CACHE_TEXT=1 ./run_training.sh
-#   OUTPUT_NAME=rosie_test MAX_TRAIN_STEPS=100 ./run_training.sh --learning_rate 8e-5
+# TQD (Temporal Quality Distribution) Sampling enables more robust learning 
+# by diversifying sample quality/complexity across training steps.
 
 PROJECT_DIR="${PROJECT_DIR:-/home/hina/Workspace/krea2-trainer}"
 DATASET_CONFIG="${DATASET_CONFIG:-${PROJECT_DIR}/configs/asian.toml}"
@@ -20,16 +18,13 @@ RAW_DIT="${RAW_DIT:-${MODEL_DIR}/krea2-raw.safetensors}"
 VAE="${VAE:-${MODEL_DIR}/qwen_image_vae.safetensors}"
 TEXT_ENCODER="${TEXT_ENCODER:-${MODEL_DIR}/Huihui-Qwen3-VL-4B-Instruct-abliterated.safetensors}"
 
-OUTPUT_NAME="${OUTPUT_NAME:-hina_krea2_lora_v3}"
+OUTPUT_NAME="${OUTPUT_NAME:-hina_krea2_lora_tqd_v1}"
 MAX_TRAIN_EPOCHS="${MAX_TRAIN_EPOCHS:-5}"
 SAVE_EVERY_N_EPOCHS="${SAVE_EVERY_N_EPOCHS:-1}"
 NUM_CPU_THREADS_PER_PROCESS="${NUM_CPU_THREADS_PER_PROCESS:-1}"
 MAX_DATA_LOADER_N_WORKERS="${MAX_DATA_LOADER_N_WORKERS:-8}"
 SEED="${SEED:-17415}"
 ENABLE_COMPILE="${ENABLE_COMPILE:-1}"
-# Krea2's checkpointed FP8 DiT hits an Inductor CUDA-Graph lifetime bug in
-# max-autotune. Keep compilation, but disable CUDA Graph capture by default.
-# Set COMPILE_MODE=max-autotune only for an explicitly validated PyTorch build.
 COMPILE_MODE="${COMPILE_MODE:-max-autotune-no-cudagraphs}"
 COMPILE_DYNAMIC="${COMPILE_DYNAMIC:-auto}"
 COMPILE_CACHE_SIZE_LIMIT="${COMPILE_CACHE_SIZE_LIMIT:-32}"
@@ -67,12 +62,10 @@ if ! command -v accelerate >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "[INFO] Project:        ${PROJECT_DIR}"
+echo "[INFO] TQD Training Project: ${PROJECT_DIR}"
 echo "[INFO] Dataset config: ${DATASET_CONFIG}"
-echo "[INFO] Model dir:      ${MODEL_DIR}"
-echo "[INFO] Output dir:     ${OUTPUT_DIR}"
 echo "[INFO] Output name:    ${OUTPUT_NAME}"
-echo "[INFO] torch.compile:  ${ENABLE_COMPILE}"
+echo "[INFO] TQD Enabled:    Yes"
 
 if [[ "${RUN_CACHE_LATENTS}" == "1" ]]; then
   echo "[INFO] Caching latents..."
@@ -94,21 +87,22 @@ TRAIN_ARGS=(
   --raw_dit "${RAW_DIT}"
   --vae "${VAE}"
   --dataset_config "${DATASET_CONFIG}"
-  # Expanded from --preset lora-default so Hina's optimizer/LR overrides are not
-  # clobbered by apply_krea2_preset() after CLI parsing.
   --sdpa
   --mixed_precision bf16
   --save_precision bf16
   --timestep_sampling krea2_shift
   --weighting_scheme none
-  --gradient_checkpointing
   --network_module krea2_trainer.networks.lora_krea2
   --network_dim 32
   --network_alpha 16
   --disable_numpy_memmap
   --fp8_base
   --fp8_scaled
-  # Hina's usual LoRA parameters.
+  # TQD Specific Settings
+  --use_tqd_sampler
+  --tqd_quality_bins 4
+  --tqd_sample_strategy balanced
+  # Hyperparameters
   --learning_rate 5e-5
   --lr_scheduler constant_with_warmup
   --lr_warmup_steps 500
@@ -123,11 +117,11 @@ TRAIN_ARGS=(
   --output_dir "${OUTPUT_DIR}"
   --output_name "${OUTPUT_NAME}"
   --logging_dir "${LOGGING_DIR}"
-  --log_prefix "asianMix_"
+  --log_prefix "tqd_rosie_"
   --log_with wandb
   --log_config
-  --log_tracker_name krea2-trainer
-  --wandb_run_name my-krea2-run
+  --log_tracker_name krea2-trainer-tqd
+  --wandb_run_name tqd-lora-run
   --seed "${SEED}"
   --max_data_loader_n_workers "${MAX_DATA_LOADER_N_WORKERS}"
   --persistent_data_loader_workers
@@ -135,9 +129,6 @@ TRAIN_ARGS=(
   --cuda_cudnn_benchmark
 )
 
-# Krea2 already compiles its repeated DiT blocks selectively.  The default is
-# worthwhile for the multi-hour 1024px runs this launcher targets; set
-# ENABLE_COMPILE=0 to bypass the one-time compilation cost for short smoke runs.
 if [[ "${ENABLE_COMPILE}" == "1" ]]; then
   TRAIN_ARGS+=(
     --compile
@@ -147,8 +138,6 @@ if [[ "${ENABLE_COMPILE}" == "1" ]]; then
   )
 fi
 
-# Passing an unset WANDB_API_KEY under `set -u` previously aborted the launcher.
-# Leave login to an existing W&B session when no key is supplied explicitly.
 if [[ -n "${WANDB_API_KEY}" ]]; then
   TRAIN_ARGS+=(--wandb_api_key "${WANDB_API_KEY}")
 fi
@@ -169,11 +158,9 @@ if [[ "${REFRESH_TEXT_CACHE_EVERY_EPOCH}" == "1" ]]; then
   )
 fi
 
-# Append any extra train_lora args passed to this script.
 TRAIN_ARGS+=("$@")
 
-echo "[INFO] Launching training..."
-# Do not enable xtrace here: the expanded command can include WANDB_API_KEY.
+echo "[INFO] Launching TQD training..."
 accelerate launch --num_cpu_threads_per_process "${NUM_CPU_THREADS_PER_PROCESS}" \
   -m krea2_trainer.scripts.train_lora \
   "${TRAIN_ARGS[@]}"
