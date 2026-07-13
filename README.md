@@ -269,6 +269,44 @@ cache_directory = "/path/to/cache"
 
 實際可用欄位仍以 upstream musubi-tuner dataset parser 支援的格式為準。
 
+### Structure–Detail TQD（選用）
+
+Krea2 是 image-only trainer，因此 TQD 使用 `structure_score` 取代影片 motion quality：它描述全局主體、姿勢與構圖是否可靠；`detail_score` 描述臉部、材質與局部紋理品質。分數必須在 `[0, 1]`，並以 JSONL manifest 提供給單一 dataset。
+
+```toml
+[[datasets]]
+image_directory = "/path/to/images"
+cache_directory = "/path/to/cache"
+tqd_score_file = "/path/to/rosie_tqd_scores.jsonl"
+```
+
+`rosie_tqd_scores.jsonl` 每行一筆，`cache_file` 必須是 cache 目錄內的檔名，不可寫絕對路徑：
+
+```json
+{"cache_file":"rosie_0001_1024x1536_krea2.safetensors","structure_score":0.91,"detail_score":0.84}
+{"cache_file":"rosie_0002_1024x1536_krea2.safetensors","structure_score":0.88,"detail_score":0.42}
+```
+
+啟動時：
+
+```bash
+accelerate launch -m krea2_trainer.scripts.train_lora \
+  --raw_dit models/krea2/raw.safetensors \
+  --vae models/qwen_image_vae.safetensors \
+  --dataset_config dataset.toml \
+  --output_dir output \
+  --output_name my_krea2_tqd_lora \
+  --timestep_sampling tqd_krea2_shift \
+  --tqd_kappa_base 2 \
+  --tqd_kappa_max 8
+```
+
+- structure 高於 detail 的圖會偏向高噪聲 timestep，強化構圖與語義結構。
+- detail 高於 structure 的圖會偏向低噪聲 timestep，強化臉部、材質與局部細節。
+- `structure_score == detail_score` 且 `--tqd_kappa_base 2` 時，會退化回 Krea2 原本的 pre-shift logit-normal sampling。
+- 不能和 `--num_timestep_buckets` 同時使用，因為後者會預先指定與樣本無關的 timestep。
+- `--tqd_quality_weighting` 會啟用 mean-one 的 `max(structure_score, detail_score)` loss weighting，近似論文中的 sample retention，但不改變每 epoch step 數。
+
 ---
 
 ## 標準訓練流程
