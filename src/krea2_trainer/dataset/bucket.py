@@ -244,6 +244,8 @@ class BucketBatchManager:
 
         batch_tensor_data = {}
         varlen_keys = set()
+        tqd_structure_scores = []
+        tqd_detail_scores = []
         for item_info in bucket[start:end]:
             sd_latent = load_file(item_info.latent_cache_path)
             sd_te = load_file(item_info.text_encoder_output_cache_path)
@@ -271,9 +273,21 @@ class BucketBatchManager:
                 if is_varlen_key:
                     varlen_keys.add(content_key)
 
+            if item_info.tqd_structure_score is not None:
+                if item_info.tqd_detail_score is None:
+                    raise ValueError(f"Incomplete TQD scores for cache item: {item_info.latent_cache_path}")
+                tqd_structure_scores.append(item_info.tqd_structure_score)
+                tqd_detail_scores.append(item_info.tqd_detail_score)
+
         for key in batch_tensor_data.keys():
             if key not in varlen_keys:
                 batch_tensor_data[key] = torch.stack(batch_tensor_data[key])
+
+        if tqd_structure_scores:
+            if len(tqd_structure_scores) != end - start:
+                raise ValueError("TQD scores must be configured for every item in a batch")
+            batch_tensor_data["tqd_structure_score"] = torch.tensor(tqd_structure_scores, dtype=torch.float32)
+            batch_tensor_data["tqd_detail_score"] = torch.tensor(tqd_detail_scores, dtype=torch.float32)
 
         if self.timestep_pool is not None:
             batch_tensor_data["timesteps"] = self.timestep_pool[idx][: end - start]  # use the pre-generated timesteps

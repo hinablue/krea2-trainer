@@ -1,5 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import glob
+import json
 import os
 import random
 import time
@@ -60,6 +61,8 @@ class ItemInfo:
         self.content = content
         self.latent_cache_path = latent_cache_path
         self.text_encoder_output_cache_path: Optional[str] = None
+        self.tqd_structure_score: Optional[float] = None
+        self.tqd_detail_score: Optional[float] = None
 
         # np.ndarray for video, list[np.ndarray] for image with multiple controls
         self.control_content: Optional[Union[np.ndarray, list[np.ndarray]]] = None
@@ -115,6 +118,7 @@ class BaseDataset(torch.utils.data.Dataset):
         cache_directory: Optional[str] = None,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        tqd_score_file: Optional[str] = None,
     ):
         self.resolution = resolution
         self.caption_extension = caption_extension
@@ -125,12 +129,49 @@ class BaseDataset(torch.utils.data.Dataset):
         self.cache_directory = cache_directory
         self.debug_dataset = debug_dataset
         self.architecture = architecture
+        self.tqd_scores = self._load_tqd_scores(tqd_score_file)
         self.seed = None
         self.current_epoch = 0
         self.shared_epoch = None
 
         if not self.enable_bucket:
             self.bucket_no_upscale = False
+
+    @staticmethod
+    def _load_tqd_scores(tqd_score_file: Optional[str]) -> dict[str, tuple[float, float]]:
+        if tqd_score_file is None:
+            return {}
+
+        score_path = os.path.abspath(tqd_score_file)
+        if not os.path.isfile(score_path):
+            raise ValueError(f"TQD score file not found: {score_path}")
+
+        scores: dict[str, tuple[float, float]] = {}
+        with open(score_path, "r", encoding="utf-8") as score_file:
+            for line_number, line in enumerate(score_file, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                    cache_file = record["cache_file"]
+                    structure_score = float(record["structure_score"])
+                    detail_score = float(record["detail_score"])
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid TQD score record at {score_path}:{line_number}") from exc
+
+                if os.path.basename(cache_file) != cache_file:
+                    raise ValueError(
+                        f"TQD cache_file must be a basename, not a path: {score_path}:{line_number}: {cache_file}"
+                    )
+                if not 0.0 <= structure_score <= 1.0 or not 0.0 <= detail_score <= 1.0:
+                    raise ValueError(f"TQD scores must be within [0, 1]: {score_path}:{line_number}")
+                if cache_file in scores:
+                    raise ValueError(f"Duplicate TQD cache_file: {score_path}:{line_number}: {cache_file}")
+
+                scores[cache_file] = (structure_score, detail_score)
+
+        logger.info("Loaded %d TQD score records from %s", len(scores), score_path)
+        return scores
 
     def get_metadata(self) -> dict:
         metadata = {
@@ -287,6 +328,7 @@ class ImageDataset(BaseDataset):
         control_resolution: Optional[Tuple[int, int]] = None,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        tqd_score_file: Optional[str] = None,
     ):
         super(ImageDataset, self).__init__(
             resolution,
@@ -298,6 +340,7 @@ class ImageDataset(BaseDataset):
             cache_directory,
             debug_dataset,
             architecture,
+            tqd_score_file,
         )
         self.image_directory = image_directory
         self.image_jsonl_file = image_jsonl_file
@@ -549,6 +592,13 @@ class ImageDataset(BaseDataset):
             item_info = ItemInfo(item_key, "", image_size, bucket_reso, latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
 
+            if self.tqd_scores:
+                cache_name = os.path.basename(cache_file)
+                try:
+                    item_info.tqd_structure_score, item_info.tqd_detail_score = self.tqd_scores[cache_name]
+                except KeyError as exc:
+                    raise ValueError(f"Missing TQD score for training cache: {cache_name}") from exc
+
             bucket = bucketed_item_info.get(bucket_reso, [])
             for _ in range(self.num_repeats):
                 bucket.append(item_info)
@@ -603,6 +653,7 @@ class VideoDataset(BaseDataset):
         fp_latent_window_size: Optional[int] = 9,
         debug_dataset: bool = False,
         architecture: str = "no_default",
+        tqd_score_file: Optional[str] = None,
     ):
         super(VideoDataset, self).__init__(
             resolution,
@@ -614,6 +665,7 @@ class VideoDataset(BaseDataset):
             cache_directory,
             debug_dataset,
             architecture,
+            tqd_score_file,
         )
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file
