@@ -344,12 +344,23 @@ accelerate launch --num_cpu_threads_per_process 1 \
   --output_name my_krea2_tqd_lora
 ```
 
-`--tqd_quality_weighting` 是選用參數；啟用後會套用 mean-one 的 `max(structure_score, detail_score)` loss weighting，近似論文中的 sample retention，但不改變每個 epoch 的 step 數。
+#### `--tqd*` 參數
 
+| 參數 | 型別／預設值 | 說明 |
+| --- | --- | --- |
+| `--tqd_kappa_base FLOAT` | `float`／`2.0` | TQD Beta 分布的基礎 concentration。只有 `--timestep_sampling tqd_krea2_shift` 會使用。必須大於 `0`；當 structure 與 detail 分數相同且設為 `2.0` 時，CDF sampling 為 uniform，會還原 Krea2 原生的 pre-shift logit-normal 分布。提高此值會讓 timestep 更集中，降低則會讓分布更分散。 |
+| `--tqd_kappa_max FLOAT` | `float`／`8.0` | structure/detail 差距最大時使用的 Beta concentration 上限；實際 concentration 會依 `abs(structure_score - detail_score)` 在 `tqd_kappa_base` 與此值之間線性插值。必須大於或等於 `--tqd_kappa_base`。提高此值會讓品質面向明顯失衡的樣本更集中在對應的高噪聲或低噪聲區域。 |
+| `--tqd_quality_weighting` | flag／預設關閉 | 依每筆樣本的 `max(structure_score, detail_score)` 調整 loss，再以目前 batch 的平均品質正規化成 mean-one。高品質樣本權重較高，低品質樣本較低；不會改變 batch 大小、epoch step 數或抽樣次數。此參數需要 dataset 提供 TQD 分數，但不強制使用 `tqd_krea2_shift`。若單一 process 的實際 batch size 為 `1`，正規化後權重固定為 `1`，因此不會產生加權效果。 |
+
+參數限制與行為：
+
+- `--tqd_kappa_base` 與 `--tqd_kappa_max` 只控制 timestep 分布，不會改寫 dataset 內的品質分數。
+- `--tqd_quality_weighting` 可獨立開關；未指定時，TQD 只改變 timestep sampling，不改變 loss 權重。
 - structure 高於 detail 的圖會偏向高噪聲 timestep，強化構圖與語義結構。
 - detail 高於 structure 的圖會偏向低噪聲 timestep，強化臉部、材質與局部細節。
 - `structure_score == detail_score` 且 `--tqd_kappa_base 2` 時，會退化回 Krea2 原本的 pre-shift logit-normal sampling。
-- 不能和 `--num_timestep_buckets` 同時使用，因為後者會預先指定與樣本無關的 timestep。
+- `--timestep_sampling tqd_krea2_shift` 不能和 `--num_timestep_buckets` 同時使用，因為後者會預先指定與樣本無關的 timestep。
+- 使用 `tqd_krea2_shift` 或 `--tqd_quality_weighting` 時，每個 training cache 都必須有有效的 structure/detail 分數；分數缺漏或超出 `[0, 1]` 會直接報錯。
 
 ---
 
