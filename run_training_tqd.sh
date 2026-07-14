@@ -9,7 +9,7 @@ set -Eeuo pipefail
 # by diversifying sample quality/complexity across training steps.
 
 PROJECT_DIR="${PROJECT_DIR:-/home/hina/Workspace/krea2-trainer}"
-DATASET_CONFIG="${DATASET_CONFIG:-${PROJECT_DIR}/configs/asian.toml}"
+DATASET_CONFIG="${DATASET_CONFIG:-${PROJECT_DIR}/configs/asian_tqd.toml}"
 MODEL_DIR="${MODEL_DIR:-${PROJECT_DIR}/models}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_DIR}/output}"
 LOGGING_DIR="${LOGGING_DIR:-${OUTPUT_DIR}/logs}"
@@ -90,8 +90,9 @@ TRAIN_ARGS=(
   --sdpa
   --mixed_precision bf16
   --save_precision bf16
-  --timestep_sampling krea2_shift
+  --timestep_sampling tqd_krea2_shift
   --weighting_scheme none
+  --gradient_checkpointing
   --network_module krea2_trainer.networks.lora_krea2
   --network_dim 32
   --network_alpha 16
@@ -99,13 +100,13 @@ TRAIN_ARGS=(
   --fp8_base
   --fp8_scaled
   # TQD Specific Settings
-  --use_tqd_sampler
-  --tqd_quality_bins 4
-  --tqd_sample_strategy balanced
+  --tqd_kappa_base 2
+  --tqd_kappa_max 8
+  --tqd_quality_weighting
   # Hyperparameters
   --learning_rate 5e-5
   --lr_scheduler constant_with_warmup
-  --lr_warmup_steps 500
+  --lr_warmup_steps 200
   --optimizer_type Adopt_adv
   --optimizer_args
     cautious_wd=true
