@@ -18,7 +18,7 @@ RAW_DIT="${RAW_DIT:-${MODEL_DIR}/krea2-raw.safetensors}"
 VAE="${VAE:-${MODEL_DIR}/qwen_image_vae.safetensors}"
 TEXT_ENCODER="${TEXT_ENCODER:-${MODEL_DIR}/Huihui-Qwen3-VL-4B-Instruct-abliterated.safetensors}"
 
-OUTPUT_NAME="${OUTPUT_NAME:-hina_krea2_lora_tqd_v1}"
+OUTPUT_NAME="${OUTPUT_NAME:-hina_krea2_tqd_lora_v1}"
 MAX_TRAIN_EPOCHS="${MAX_TRAIN_EPOCHS:-5}"
 SAVE_EVERY_N_EPOCHS="${SAVE_EVERY_N_EPOCHS:-1}"
 NUM_CPU_THREADS_PER_PROCESS="${NUM_CPU_THREADS_PER_PROCESS:-1}"
@@ -104,6 +104,14 @@ TRAIN_ARGS=(
   --tqd_kappa_max 8
   --tqd_quality_weighting
   # Hyperparameters
+#  --learning_rate 1
+#  --lr_scheduler cosine
+#  --optimizer_type Prodigy_adv
+#  --optimizer_args
+#    weight_decay=0.5
+#    d_coef=2
+#    safeguard_warmup=true
+#    betas="0.9,0.995"
   --learning_rate 5e-5
   --lr_scheduler constant_with_warmup
   --lr_warmup_steps 200
