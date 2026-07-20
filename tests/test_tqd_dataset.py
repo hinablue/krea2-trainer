@@ -17,49 +17,120 @@ class TQDScoreManifestTests(unittest.TestCase):
         path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
         return path
 
-    def test_loads_valid_manifest(self):
+    def test_loads_canonical_image_file_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.write_manifest(
+                Path(tmp),
+                [{"image_file": "sample.png", "structure_score": 0.9, "detail_score": 0.4}],
+            )
+            self.assertEqual(
+                BaseDataset._load_tqd_scores(str(manifest)),
+                {"sample": (0.9, 0.4)},
+            )
+
+    def test_attaches_canonical_image_file_scores(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.write_manifest(
+                Path(tmp),
+                [{"image_file": "sample.png", "structure_score": 0.9, "detail_score": 0.4}],
+            )
+            dataset = BaseDataset((1024, 1024), None, 1, 1, False, False, tqd_score_file=str(manifest))
+            cache_file = "/tmp/sample_1024x1024_krea2.safetensors"
+            item = ItemInfo("sample", "", (1024, 1024), (1024, 1024), latent_cache_path=cache_file)
+            dataset.attach_tqd_scores(item, cache_file)
+            self.assertEqual(item.tqd_structure_score, 0.9)
+            self.assertEqual(item.tqd_detail_score, 0.4)
+
+    def test_loads_legacy_cache_file_records(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = self.write_manifest(
                 Path(tmp),
                 [{"cache_file": "sample_1024x1024_krea2.safetensors", "structure_score": 0.9, "detail_score": 0.4}],
             )
-
             self.assertEqual(
                 BaseDataset._load_tqd_scores(str(manifest)),
-                {"sample_1024x1024_krea2.safetensors": (0.9, 0.4)},
+                {"sample": (0.9, 0.4)},
             )
 
-    def test_rejects_duplicate_or_out_of_range_scores(self):
+    def test_rejects_both_keys_or_neither_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            both = self.write_manifest(
+                directory,
+                [{"image_file": "sample.png", "cache_file": "sample_1024x1024_krea2.safetensors", "structure_score": 0.5, "detail_score": 0.5}],
+            )
+            with self.assertRaisesRegex(ValueError, "exactly one of"):
+                BaseDataset._load_tqd_scores(str(both))
+
+            neither = self.write_manifest(
+                directory,
+                [{"structure_score": 0.5, "detail_score": 0.5}],
+            )
+            with self.assertRaisesRegex(ValueError, "exactly one of"):
+                BaseDataset._load_tqd_scores(str(neither))
+
+    def test_rejects_nested_or_absolute_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            nested = self.write_manifest(
+                directory,
+                [{"image_file": "nested/sample.png", "structure_score": 0.5, "detail_score": 0.5}],
+            )
+            with self.assertRaisesRegex(ValueError, "basename"):
+                BaseDataset._load_tqd_scores(str(nested))
+
+            absolute = self.write_manifest(
+                directory,
+                [{"image_file": "/tmp/sample.png", "structure_score": 0.5, "detail_score": 0.5}],
+            )
+            with self.assertRaisesRegex(ValueError, "basename"):
+                BaseDataset._load_tqd_scores(str(absolute))
+
+    def test_rejects_duplicate_stems_or_same_stem_different_extension(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
             duplicate = self.write_manifest(
                 directory,
                 [
-                    {"cache_file": "sample_1024x1024_krea2.safetensors", "structure_score": 0.5, "detail_score": 0.5},
-                    {"cache_file": "sample_1024x1024_krea2.safetensors", "structure_score": 0.6, "detail_score": 0.4},
+                    {"image_file": "sample.png", "structure_score": 0.5, "detail_score": 0.5},
+                    {"image_file": "sample.png", "structure_score": 0.6, "detail_score": 0.4},
                 ],
             )
-            with self.assertRaisesRegex(ValueError, "Duplicate TQD cache_file"):
+            with self.assertRaisesRegex(ValueError, "Duplicate"):
                 BaseDataset._load_tqd_scores(str(duplicate))
 
-            invalid = self.write_manifest(
+            collision = self.write_manifest(
                 directory,
-                [{"cache_file": "other_1024x1024_krea2.safetensors", "structure_score": 1.1, "detail_score": 0.5}],
+                [
+                    {"image_file": "sample.png", "structure_score": 0.5, "detail_score": 0.5},
+                    {"image_file": "sample.webp", "structure_score": 0.6, "detail_score": 0.4},
+                ],
             )
-            with self.assertRaisesRegex(ValueError, "within \\[0, 1\\]"):
-                BaseDataset._load_tqd_scores(str(invalid))
+            with self.assertRaisesRegex(ValueError, "Duplicate"):
+                BaseDataset._load_tqd_scores(str(collision))
 
-    def test_rejects_malformed_records(self):
+    def test_rejects_malformed_or_out_of_range_scores(self):
         with tempfile.TemporaryDirectory() as tmp:
-            malformed = self.write_manifest(Path(tmp), [{"cache_file": "sample.safetensors", "structure_score": 0.5}])
+            directory = Path(tmp)
+            malformed = self.write_manifest(
+                directory,
+                [{"image_file": "sample.png", "structure_score": 0.5}],
+            )
             with self.assertRaisesRegex(ValueError, "Invalid TQD score record"):
                 BaseDataset._load_tqd_scores(str(malformed))
+
+            out_of_range = self.write_manifest(
+                directory,
+                [{"image_file": "sample.png", "structure_score": 1.1, "detail_score": 0.5}],
+            )
+            with self.assertRaisesRegex(ValueError, "within \\[0, 1\\]"):
+                BaseDataset._load_tqd_scores(str(out_of_range))
 
     def test_score_file_requires_every_training_cache_even_when_empty(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = self.write_manifest(Path(tmp), [])
             dataset = BaseDataset((1024, 1024), None, 1, 1, False, False, tqd_score_file=str(manifest))
-            cache_file = "/tmp/sample.safetensors"
+            cache_file = "/tmp/sample_1024x1024_krea2.safetensors"
             item = ItemInfo("sample", "", (1024, 1024), (1024, 1024), latent_cache_path=cache_file)
 
             with self.assertRaisesRegex(ValueError, "Missing TQD score"):

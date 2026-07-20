@@ -1,0 +1,37 @@
+# Version control and local environments
+.git
+.gitignore
+.hermes
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+
+# Never send local credentials or dotenv data
+.env
+.env.*
+!runpod/train.env.example
+*.pem
+*.key
+
+# Never send model/data/output artifacts to the Docker daemon
+models
+model
+input
+output
+logs
+datasets
+data
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.tar
+*.tar.gz
+*.zip
+
+# Developer-only files
+configs
+benchmarks
+wandb

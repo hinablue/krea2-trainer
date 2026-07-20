@@ -33,6 +33,7 @@ dev = ["ruff>=0.12.10"]
 krea2-train-lora = "krea2_trainer.scripts.train_lora:main"
 krea2-cache-latents = "krea2_trainer.scripts.cache_latents:main"
 krea2-cache-text = "krea2_trainer.scripts.cache_text_encoder:main"
+krea2-download-models = "krea2_trainer.scripts.download_models:main"
 
 [build-system]
 requires = ["hatchling"]

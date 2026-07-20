@@ -154,12 +154,13 @@ pip install -e .
 
 ## CLI 指令
 
-安裝後會提供三個 console scripts：
+安裝後會提供四個 console scripts：
 
 ```bash
 krea2-cache-latents
 krea2-cache-text
 krea2-train-lora
+krea2-download-models
 ```
 
 也可以用 module 方式執行：
@@ -280,10 +281,10 @@ TQD 用來處理訓練資料品質不均的情況，依照不同品質面向（�
 
 #### 操作範例
 
-先完成 latent cache（Step 1），再從 cache 目錄產生一份中性分數範本：
+你可以直接針對原始圖片產生分數範本（不需等待 latent cache 完成）：
 
 ```bash
-export CACHE_DIR=/path/to/cache
+export IMAGE_DIR=/path/to/images
 export SCORE_FILE=/path/to/rosie_tqd_scores.jsonl
 
 python - <<'PY' > "$SCORE_FILE"
@@ -291,22 +292,26 @@ import json
 import os
 from pathlib import Path
 
-cache_dir = Path(os.environ["CACHE_DIR"])
-for cache_file in sorted(cache_dir.glob("*_krea2.safetensors")):
-    print(json.dumps({
-        "cache_file": cache_file.name,
-        "structure_score": 0.5,
-        "detail_score": 0.5,
-    }))
+image_dir = Path(os.environ["IMAGE_DIR"])
+# 支援常見圖片副檔名
+for image_file in sorted(image_dir.iterdir()):
+    if image_file.suffix.lower() in [".png", ".jpg", ".jpeg", ".webp"]:
+        print(json.dumps({
+            "image_file": image_file.name,
+            "structure_score": 0.5,
+            "detail_score": 0.5,
+        }))
 PY
 ```
 
-逐筆檢查並修改 `rosie_tqd_scores.jsonl`。`cache_file` 必須是 cache 目錄內的 latent cache 檔名，不能寫絕對路徑；每個訓練 cache 都必須剛好有一筆分數：
+逐筆檢查並修改 `rosie_tqd_scores.jsonl`。`image_file` 必須是來源圖片的檔名，不能寫絕對路徑；每張訓練圖片都必須剛好有一筆分數：
 
 ```json
-{"cache_file":"rosie_0001_1024x1536_krea2.safetensors","structure_score":0.91,"detail_score":0.84}
-{"cache_file":"rosie_0002_1024x1536_krea2.safetensors","structure_score":0.88,"detail_score":0.42}
+{"image_file":"rosie_0001.png","structure_score":0.91,"detail_score":0.84}
+{"image_file":"rosie_0002.webp","structure_score":0.88,"detail_score":0.42}
 ```
+
+> **注意：** 舊版的 `cache_file` 鍵值（例如 `{"cache_file": "rosie_0001_1024x1536_krea2.safetensors", ...}`）仍保留向下相容性，但建議新專案全面改用 `image_file`。
 
 在對應的 dataset 設定加入 manifest：
 
@@ -836,6 +841,26 @@ Krea2 sample prompt 會在訓練前用 Qwen3-VL text encoder 預先編碼，然�
 2. 保留 LoRA hook 套在目前 DiT 上。
 3. 用 Turbo sampling schedule 產圖。
 4. sample 結束後恢復 RAW DiT weights。
+
+---
+
+## 容器訓練
+
+本 repo 提供兩種 CUDA 13.0 容器工作流。兩者共用 `/workspace` 目錄契約與 `runpod/train.sh`，容器啟動後只會待命，不會自動下載模型、建立 cache 或開始訓練。
+
+| 環境 | Container 定義 | 操作文件 |
+|---|---|---|
+| 本機 NVIDIA Docker | `Dockerfile`、`docker-compose.yml` | [使用 Docker Compose 在本機訓練](docs/local-docker-training.md) |
+| RunPod GPU Pod | `runpod/Dockerfile` | [在 RunPod 上訓練](docs/runpod-training.md) |
+
+本機 Docker Compose 最短流程：
+
+```bash
+docker compose up -d --build trainer
+docker compose exec trainer /opt/krea2-trainer/runpod/train.sh
+```
+
+RunPod 文件涵蓋 image、Network Volume、UI、API/MCP、TQD、恢復與停止計費。設計與驗收條件保留於 [`docs/plans/2026-07-20-runpod-training-workflow.md`](docs/plans/2026-07-20-runpod-training-workflow.md)。
 
 ---
 

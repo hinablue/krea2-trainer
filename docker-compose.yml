@@ -1,0 +1,44 @@
+name: krea2-trainer
+
+services:
+  trainer:
+    image: ${KREA2_IMAGE:-krea2-trainer:local-cu130}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${KREA2_BASE_IMAGE:-nvcr.io/nvidia/pytorch:25.11-py3}
+    container_name: krea2-trainer
+    init: true
+    gpus: all
+    shm_size: ${KREA2_SHM_SIZE:-16gb}
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    stop_grace_period: 2m
+    environment:
+      AUTO_START_TRAINING: "0"
+      ENV_FILE: /workspace/configs/train.env
+      DATASET_CONFIG: /workspace/configs/dataset.toml
+      MODEL_DIR: /workspace/models
+      OUTPUT_DIR: /workspace/output/checkpoints
+      LOGGING_DIR: /workspace/output/logs
+      HF_HOME: /workspace/.cache/huggingface
+      HF_TOKEN: ${HF_TOKEN:-}
+      WANDB_API_KEY: ${WANDB_API_KEY:-}
+    volumes:
+      - ${KREA2_WORKSPACE:-./workspace}:/workspace
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import torch; assert torch.cuda.is_available();
+          assert (torch.version.cuda or '').startswith('13.0')"
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 2m
+    command: ["sleep", "infinity"]

@@ -1,8 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor
 import glob
 import json
+import math
 import os
 import random
+import re
 import time
 from typing import Any, Optional, Sequence, Tuple, Union, TYPE_CHECKING
 
@@ -139,6 +141,17 @@ class BaseDataset(torch.utils.data.Dataset):
             self.bucket_no_upscale = False
 
     @staticmethod
+    def _normalize_tqd_index(field: str, value: object) -> str:
+        if not isinstance(value, str) or not value or os.path.basename(value) != value:
+            raise ValueError(f"TQD {field} must be a non-empty basename, not a path: {value!r}")
+        stem = os.path.splitext(value)[0]
+        if field == "cache_file":
+            stem = re.sub(r"_\d+x\d+_[^.]+$", "", stem)
+        if not stem:
+            raise ValueError(f"TQD {field} does not contain a usable image stem: {value!r}")
+        return stem
+
+    @staticmethod
     def _load_tqd_scores(tqd_score_file: Optional[str]) -> dict[str, tuple[float, float]]:
         if tqd_score_file is None:
             return {}
@@ -154,36 +167,40 @@ class BaseDataset(torch.utils.data.Dataset):
                     continue
                 try:
                     record = json.loads(line)
-                    cache_file = record["cache_file"]
+                    if not isinstance(record, dict):
+                        raise TypeError("record must be an object")
+                    present = [field for field in ("image_file", "cache_file") if field in record]
+                    if len(present) != 1:
+                        raise ValueError("record must contain exactly one of image_file or cache_file")
+                    field = present[0]
+                    index = BaseDataset._normalize_tqd_index(field, record[field])
                     structure_score = float(record["structure_score"])
                     detail_score = float(record["detail_score"])
                 except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-                    raise ValueError(f"Invalid TQD score record at {score_path}:{line_number}") from exc
+                    raise ValueError(f"Invalid TQD score record at {score_path}:{line_number}: {exc}") from exc
 
-                if os.path.basename(cache_file) != cache_file:
-                    raise ValueError(
-                        f"TQD cache_file must be a basename, not a path: {score_path}:{line_number}: {cache_file}"
-                    )
+                if not math.isfinite(structure_score) or not math.isfinite(detail_score):
+                    raise ValueError(f"TQD scores must be finite and within [0, 1]: {score_path}:{line_number}")
                 if not 0.0 <= structure_score <= 1.0 or not 0.0 <= detail_score <= 1.0:
                     raise ValueError(f"TQD scores must be within [0, 1]: {score_path}:{line_number}")
-                if cache_file in scores:
-                    raise ValueError(f"Duplicate TQD cache_file: {score_path}:{line_number}: {cache_file}")
+                if index in scores:
+                    raise ValueError(f"Duplicate TQD image stem: {score_path}:{line_number}: {index}")
 
-                scores[cache_file] = (structure_score, detail_score)
+                scores[index] = (structure_score, detail_score)
 
         logger.info("Loaded %d TQD score records from %s", len(scores), score_path)
         return scores
 
     def attach_tqd_scores(self, item_info: ItemInfo, cache_file: str) -> None:
-        """Attach required TQD scores to one training cache item when configured."""
+        """Attach required TQD scores by the source image stem when configured."""
         if self.tqd_score_file is None:
             return
 
-        cache_name = os.path.basename(cache_file)
+        item_stem = os.path.splitext(os.path.basename(item_info.item_key))[0]
         try:
-            item_info.tqd_structure_score, item_info.tqd_detail_score = self.tqd_scores[cache_name]
+            item_info.tqd_structure_score, item_info.tqd_detail_score = self.tqd_scores[item_stem]
         except KeyError as exc:
-            raise ValueError(f"Missing TQD score for training cache: {cache_name}") from exc
+            raise ValueError(f"Missing TQD score for source image: {item_stem}") from exc
 
     def get_metadata(self) -> dict:
         metadata = {
