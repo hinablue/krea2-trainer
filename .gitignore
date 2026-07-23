@@ -2,6 +2,8 @@
 /models/
 /output/
 /configs/
+/datasets/
+.cache
 
 # Python environments and build artifacts.
 /.venv/

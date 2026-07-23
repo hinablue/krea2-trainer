@@ -27,6 +27,7 @@ services:
       HF_TOKEN: ${HF_TOKEN:-}
       WANDB_API_KEY: ${WANDB_API_KEY:-}
     volumes:
+      - ${KREA2_HF_HOME:-./workspace/.cache/huggingface}:/workspace/.cache/huggingface
       - ${KREA2_WORKSPACE:-./workspace}:/workspace
     ulimits:
       memlock: -1
