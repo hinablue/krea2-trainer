@@ -1,8 +1,12 @@
 # Local models, datasets, generated training artifacts, and machine-specific config.
-/models/
-/output/
-/configs/
-/datasets/
+models/
+workspace/models/
+workspace/output/
+workspace/datasets/
+workspace/.cache/
+output/
+configs/
+datasets/
 .cache
 
 # Python environments and build artifacts.
