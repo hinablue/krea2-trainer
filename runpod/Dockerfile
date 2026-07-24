@@ -17,7 +17,7 @@ COPY scripts/ scripts/
 COPY runpod/ runpod/
 COPY docs/ docs/
 RUN chmod +x scripts/train_from_env.sh runpod/train.sh runpod/entrypoint.sh \
-    && uv sync --frozen --extra cu130
+    && uv sync --frozen --extra cu130 --extra tracking
 
 WORKDIR /workspace
 ENTRYPOINT ["/opt/krea2-trainer/runpod/entrypoint.sh"]
