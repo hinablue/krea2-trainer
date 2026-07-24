@@ -1,9 +1,6 @@
 # Local models, datasets, generated training artifacts, and machine-specific config.
 models/
-workspace/models/
-workspace/output/
-workspace/datasets/
-workspace/.cache/
+/workspace/
 output/
 configs/
 datasets/

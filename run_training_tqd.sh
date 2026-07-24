@@ -5,7 +5,7 @@ export PROJECT_DIR
 export TRAIN_MODE="${TRAIN_MODE:-tqd}"
 export DATASET_CONFIG="${DATASET_CONFIG:-${PROJECT_DIR}/configs/asian_tqd.toml}"
 export MODEL_DIR="${MODEL_DIR:-${PROJECT_DIR}/models}"
-export RAW_DIT="${RAW_DIT:-${MODEL_DIR}/krea2-raw.safetensors}"
+export RAW_DIT="${RAW_DIT:-${MODEL_DIR}/krea2_raw_bf16.safetensors}"
 export VAE="${VAE:-${MODEL_DIR}/qwen_image_vae.safetensors}"
 export TEXT_ENCODER="${TEXT_ENCODER:-${MODEL_DIR}/Huihui-Qwen3-VL-4B-Instruct-abliterated.safetensors}"
 export OUTPUT_NAME="${OUTPUT_NAME:-hina_krea2_tqd_lora_v1}"

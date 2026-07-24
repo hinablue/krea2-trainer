@@ -246,8 +246,13 @@ class Krea2NetworkTrainer(NetworkTrainer):
                     embed = hiddens[0][mask[0]]  # gather valid tokens -> (valid_len, L, D), drops padding
                     te_outputs[p] = embed.to("cpu")
 
+        # Offload Text Encoder to CPU and delete to free GPU memory before training.
+        # Qwen3-VL-4B occupies ~8GB in bf16; moving to CPU first ensures tensors are
+        # deallocated from the GPU rather than moved into the CUDA cache.
+        encoder.to("cpu", non_blocking=True)
         del encoder
         gc.collect()
+        torch.cuda.empty_cache()
         clean_memory_on_device(device)
 
         sample_parameters = []

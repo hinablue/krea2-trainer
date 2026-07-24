@@ -1,6 +1,23 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+load_env_file() {
+  local file="$1" line key value
+  [[ -f "${file}" ]] || { echo "[ERROR] ENV_FILE not found: ${file}" >&2; return 1; }
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line}" || "${line}" =~ ^[[:space:]]*# ]] && continue
+    [[ "${line}" == *=* ]] || { echo "[ERROR] Invalid ENV_FILE line (expected KEY=VALUE)" >&2; return 1; }
+    key="${line%%=*}"; value="${line#*=}"
+    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "[ERROR] Invalid ENV_FILE variable name: ${key}" >&2; return 1; }
+    if [[ ! -v "${key}" ]]; then
+      printf -v "${key}" '%s' "${value}"
+      export "${key}"
+    fi
+  done < "${file}"
+}
+
+[[ -n "${ENV_FILE:-}" ]] && load_env_file "${ENV_FILE}"
 PROJECT_DIR="${PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 DATASET_CONFIG="${DATASET_CONFIG:?DATASET_CONFIG is required}"
 MODEL_DIR="${MODEL_DIR:-${PROJECT_DIR}/models}"

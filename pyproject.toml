@@ -20,6 +20,7 @@ dependencies = [
     "transformers==4.57.6",
     "voluptuous==0.15.2",
     "torchvision>=0.20.1",
+    "wandb>=0.17.0",
 ]
 
 [project.optional-dependencies]

@@ -13,6 +13,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git \
+    ffmpeg libsm6 libxext6 libgl1 \
     && rm -rf /var/lib/apt/lists/* \
     && curl -LsSf https://astral.sh/uv/install.sh | sh
 
@@ -24,7 +25,7 @@ COPY runpod/ runpod/
 COPY docs/ docs/
 
 RUN chmod +x scripts/train_from_env.sh runpod/train.sh runpod/entrypoint.sh \
-    && uv sync --frozen --extra cu130
+    && uv sync --frozen --extra cu130 --extra tracking
 
 WORKDIR /workspace
 ENTRYPOINT ["/opt/krea2-trainer/runpod/entrypoint.sh"]
