@@ -48,11 +48,14 @@ def main():
 
     args = parser.parse_args()
 
-    if args.vae_dtype is not None:
-        raise ValueError("VAE dtype is not supported in Krea 2 (uses the Qwen-Image VAE default).")
-
     device = args.device if hasattr(args, "device") and args.device else ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device)
+
+    # Parse custom VAE precision (defaults to float32 for safety)
+    from krea2_trainer.utils.model_utils import str_to_dtype
+    vae_dtype = torch.float32
+    if args.vae_dtype is not None:
+        vae_dtype = str_to_dtype(args.vae_dtype)
 
     # Load dataset config
     blueprint_generator = BlueprintGenerator(ConfigSanitizer())
@@ -73,7 +76,7 @@ def main():
 
     logger.debug(f"Loading VAE model from {args.vae}")
     vae = qwen_image_utils.load_vae(args.vae, 3, device=device, disable_mmap=True)
-    vae.to(device)
+    vae.to(device=device, dtype=vae_dtype)
 
     def encode(batch: List[ItemInfo]):
         encode_and_save_batch(vae, batch)
