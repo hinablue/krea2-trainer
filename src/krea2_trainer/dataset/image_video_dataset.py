@@ -146,7 +146,7 @@ class BaseDataset(torch.utils.data.Dataset):
             raise ValueError(f"TQD {field} must be a non-empty basename, not a path: {value!r}")
         stem = os.path.splitext(value)[0]
         if field == "cache_file":
-            stem = re.sub(r"_\d+x\d+_[^.]+$", "", stem)
+            stem = re.sub(r"_\d+x\d+_[^_]+$", "", stem)
         if not stem:
             raise ValueError(f"TQD {field} does not contain a usable image stem: {value!r}")
         return stem

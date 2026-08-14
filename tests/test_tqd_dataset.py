@@ -52,6 +52,23 @@ class TQDScoreManifestTests(unittest.TestCase):
                 {"sample": (0.9, 0.4)},
             )
 
+    def test_legacy_cache_normalization_only_removes_final_generated_suffix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self.write_manifest(
+                Path(tmp),
+                [
+                    {
+                        "cache_file": "portrait_1024x1024_kr2_1024x1536_kr2.safetensors",
+                        "structure_score": 0.9,
+                        "detail_score": 0.4,
+                    }
+                ],
+            )
+            self.assertEqual(
+                BaseDataset._load_tqd_scores(str(manifest)),
+                {"portrait_1024x1024_kr2": (0.9, 0.4)},
+            )
+
     def test_rejects_both_keys_or_neither_key(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
