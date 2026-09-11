@@ -25,7 +25,7 @@ from einops import rearrange, repeat
 
 from krea2_trainer.dataset.architectures import ARCHITECTURE_KREA2, ARCHITECTURE_KREA2_FULL
 from krea2_trainer.dataset.image_video_dataset import ItemInfo, save_text_encoder_output_cache_krea2
-from krea2_trainer.training.trainer_base import DiTOutput, NetworkTrainer
+from krea2_trainer.training.trainer_base import DiTOutput, NetworkTrainer, parse_cli_key_value_args
 from krea2_trainer.training.accelerator_setup import clean_memory_on_device
 from krea2_trainer.training.sampling_prompts import load_prompts
 from krea2_trainer.training.parser_common import setup_parser_common, read_config_from_file
@@ -560,74 +560,79 @@ class Krea2NetworkTrainer(NetworkTrainer):
         # K2 latents are already normalized by the Qwen-Image VAE caching ((raw-mean)/std).
         return latents
 
-    def call_dit(
-        self,
-        args: argparse.Namespace,
-        accelerator: Accelerator,
-        transformer,
-        latents: torch.Tensor,
-        batch: dict[str, torch.Tensor],
-        noise: torch.Tensor,
-        noisy_model_input: torch.Tensor,
-        timesteps: torch.Tensor,
-        network_dtype: torch.dtype,
-        **kwargs,
-    ) -> DiTOutput:
-        model = transformer  # SingleStreamDiT
+    def _prepare_dit_inputs(self, args, accelerator, model, batch, noise, noisy_model_input, timesteps, network_dtype):
         device = accelerator.device
         patch = model.config.patch
-
         latents = batch["latents"]  # (B, C, 1, H, W)
         bsize = latents.shape[0]
         assert latents.shape[2] == 1, f"K2 expects single-frame latents (B,C,1,H,W), got {latents.shape}"
-
-        # --- image tokens / pos / mask (replicates krea2 sampling.prepare) ---
         nmi = noisy_model_input.squeeze(2)  # (B, C, H, W)
         _, _, lat_h, lat_w = nmi.shape
         h_, w_ = lat_h // patch, lat_w // patch
-
         img_tokens = rearrange(nmi, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch)
-
-        imgids = torch.zeros((h_, w_, 3), device=device)
-        imgids[..., 1] = torch.arange(h_, device=device)[:, None]
-        imgids[..., 2] = torch.arange(w_, device=device)[None, :]
-        imgpos = repeat(imgids, "h w three -> b (h w) three", b=bsize, three=3)
-        imgmask = torch.ones(bsize, h_ * w_, device=device, dtype=torch.bool)
-
-        # --- text tokens / pos / mask (varlen -> padded batch) ---
-        vl_embed = batch["krea2_vl_embed"]  # list of (valid_len, num_layers, hidden)
+        prepare_metadata = getattr(accelerator.unwrap_model(model), "prepare_training_metadata", None)
+        pairs = batch.get("_krea2_pair_count") if prepare_metadata is not None else None
+        vl_embed = batch["krea2_vl_embed"]
+        if pairs is not None:
+            vl_embed = vl_embed[:pairs]
         txt_seq_lens = [x.shape[0] for x in vl_embed]
         max_len = max(txt_seq_lens)
-        # pad along the sequence axis (dim 0): F.pad pads last dim first, so (0,0)x2 then (0, pad)
-        vl_embed = [F.pad(x, (0, 0, 0, 0, 0, max_len - x.shape[0])) for x in vl_embed]
-        context = torch.stack(vl_embed, dim=0).to(device=device, dtype=network_dtype)  # (B, max_len, L, D)
+        context = torch.stack(
+            [x if x.shape[0] == max_len else F.pad(x, (0, 0, 0, 0, 0, max_len - x.shape[0])) for x in vl_embed]
+        ).to(device=device, dtype=network_dtype)
+        inputs = dict(
+            img=img_tokens.to(device=device, dtype=network_dtype),
+            context=context,
+            t=(timesteps / 1000.0).to(device=device),
+            pos=None,
+            mask=None,
+        )
+        if prepare_metadata is not None:
+            # Keep compiled/non-SDPA shape padding unchanged. Eager SDPA can
+            # omit masked dummy tokens from projections and MLPs as well.
+            unwrapped = accelerator.unwrap_model(model)
+            network_args = parse_cli_key_value_args(getattr(args, "network_args", None))
+            has_dropout = bool(getattr(args, "network_dropout", None)) or any(
+                value not in (None, 0, False) for key, value in network_args.items() if key.endswith("dropout")
+            )
+            padding = 256 if getattr(args, "compile", False) or unwrapped.attn_mode != "torch" or has_dropout else 1
+            inputs["training_metadata"] = prepare_metadata(
+                h_, w_, txt_seq_lens, device, paired=pairs is not None, pad_to_multiple=padding, image_only_head=not has_dropout
+            )
+        else:
+            # Compatibility with small/custom DiTs implementing the native API.
+            imgids = torch.zeros((h_, w_, 3), device=device)
+            imgids[..., 1] = torch.arange(h_, device=device)[:, None]
+            imgids[..., 2] = torch.arange(w_, device=device)[None, :]
+            imgpos = repeat(imgids, "h w three -> b (h w) three", b=bsize, three=3)
+            imgmask = torch.ones(bsize, h_ * w_, device=device, dtype=torch.bool)
+            txtmask = torch.arange(max_len, device=device)[None, :] < torch.tensor(txt_seq_lens, device=device)[:, None]
+            inputs["mask"] = torch.cat((imgmask, txtmask), dim=1)
+            inputs["pos"] = torch.cat((imgpos, torch.zeros(bsize, max_len, 3, device=device)), dim=1)
+        # Non-reentrant checkpoint records the LoRA graph without requiring
+        # gradients on raw inputs. These inputs can safely serve both CPO passes.
+        target = noise - latents.to(device=device, dtype=network_dtype)
+        return inputs, target, h_, w_, patch
 
-        txtmask = torch.zeros(bsize, max_len, device=device, dtype=torch.bool)
-        for i, n in enumerate(txt_seq_lens):
-            txtmask[i, :n] = True
-        txtpos = torch.zeros(bsize, max_len, 3, device=device)
-
-        # --- combine (image-first: valid tokens form a contiguous prefix per sample) ---
-        mask = torch.cat((imgmask, txtmask), dim=1)
-        pos = torch.cat((imgpos, txtpos), dim=1)
-
-        img_tokens = img_tokens.to(device=device, dtype=network_dtype)
-        t = (timesteps / 1000.0).to(device=device)
-
-        if args.gradient_checkpointing:
-            img_tokens.requires_grad_(True)
-            context.requires_grad_(True)
-
+    def call_dit(
+        self, args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype, **kwargs
+    ) -> DiTOutput:
+        prepared = batch.get("_krea2_prepared_inputs")
+        if prepared is None:
+            prepared = self._prepare_dit_inputs(
+                args, accelerator, transformer, batch, noise, noisy_model_input, timesteps, network_dtype
+            )
+            if "_krea2_pair_count" in batch:
+                # Lifetime is this paired batch only; never cache model outputs.
+                batch["_krea2_prepared_inputs"] = prepared
+        inputs, target, h_, w_, patch = prepared
         with accelerator.autocast():
-            model_pred = model(img=img_tokens, context=context, t=t, pos=pos, mask=mask)  # (B, h*w, c*ph*pw)
+            model_pred = transformer(**inputs)
 
         # unpatchify to latent space (B, C, 1, H, W)
         model_pred = rearrange(model_pred, "b (h w) (c ph pw) -> b c (h ph) (w pw)", ph=patch, pw=patch, h=h_, w=w_)
         model_pred = model_pred.unsqueeze(2)  # (B, C, 1, H, W)
 
-        # flow matching target (velocity): noise - data
-        latents = latents.to(device=device, dtype=network_dtype)
-        target = noise - latents
         return DiTOutput(pred=model_pred, target=target)
 
     # endregion model specific

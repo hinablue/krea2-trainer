@@ -17,6 +17,7 @@ from krea2_trainer.dataset import config_utils
 from krea2_trainer.krea2_train_network import Krea2NetworkTrainer
 from krea2_trainer.networks import lora_krea2
 from krea2_trainer.training.accelerator_setup import collator_class
+from krea2_trainer.utils.tensor_checks import all_finite
 from krea2_trainer.training.preference import (
     POST_TRAINING_STATE,
     build_reference_contract,
@@ -268,8 +269,8 @@ class Krea2PostTrainingTrainer(Krea2NetworkTrainer):
             for value in (latents, rejected, noise, *embeds):
                 if not value.is_floating_point():
                     raise ValueError("FlowCPO batch tensors must be floating point")
-                if not torch.isfinite(value).all():
-                    raise FloatingPointError("FlowCPO batch tensors must be finite")
+            if not all_finite((latents, rejected, noise, *embeds)):
+                raise FloatingPointError("FlowCPO batch tensors must be finite")
         device = accelerator.device
         chosen = latents.to(device=device, dtype=network_dtype)
         rejected = self.scale_shift_latents(rejected).to(device=device, dtype=network_dtype)

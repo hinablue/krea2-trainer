@@ -339,7 +339,7 @@ class PreferenceDataset(BaseDataset):
             start = batch_index * self.batch_size
             chosen_items = self.batch_manager.buckets[bucket][start : start + self.batch_size]
             rejected_items = [self._rejected_by_chosen[item] for item in chosen_items]
-            rejected_batch = BucketBatchManager({bucket: rejected_items}, self.batch_size)[0]
+            rejected_batch = BucketBatchManager({bucket: rejected_items}, self.batch_size).load_batch(0, latents_only=True)
             batch["rejected_latents"] = rejected_batch["latents"]
         return batch
 

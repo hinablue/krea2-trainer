@@ -202,6 +202,7 @@ class Krea2FlowCPOTrainer(Krea2PostTrainingTrainer):
         pairs, t, combined, pair_batch, paired_noise, noisy, timesteps = self._prepare_paired_batch(
             args, accelerator, batch, latents, noise, dit_dtype, network_dtype
         )
+        pair_batch["_krea2_pair_count"] = pairs
         with old_adapter_context(policy_network, self.ema_network, accelerator.unwrap_model(transformer)):
             old = self.call_dit(args, accelerator, transformer, combined, pair_batch, paired_noise, noisy, timesteps, network_dtype)
         # No adapter state mutation follows this forward until checkpointed

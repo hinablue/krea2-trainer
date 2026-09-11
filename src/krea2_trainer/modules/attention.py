@@ -36,6 +36,8 @@ class AttentionParams:
     seqlens: Optional[torch.Tensor] = None
     cu_seqlens: Optional[torch.Tensor] = None
     max_seqlen: Optional[int] = None
+    lengths_known: bool = False
+    uniform_seqlen: Optional[int] = None
 
     @staticmethod
     def create_attention_params(attn_mode: Optional[str], split_attn: bool) -> "AttentionParams":
@@ -43,19 +45,44 @@ class AttentionParams:
 
     @staticmethod
     def create_attention_params_from_mask(
-        attn_mode: Optional[str], split_attn: bool, img_len: Optional[int], attention_mask: Optional[torch.Tensor]
+        attn_mode: Optional[str],
+        split_attn: bool,
+        img_len: Optional[int],
+        attention_mask: Optional[torch.Tensor],
+        text_lengths: Optional[tuple[int, ...]] = None,
     ) -> "AttentionParams":
         if attention_mask is None:
             # No attention mask provided: assume all tokens are valid
             return AttentionParams(attn_mode, split_attn, None, None, None, None, None)
         else:
             # Note: attention_mask is only for text tokens, not including image tokens
-            seqlens = attention_mask.sum(dim=1).to(torch.int32) + img_len  # [B]
+            if text_lengths is not None:
+                if len(text_lengths) != attention_mask.shape[0] or any(
+                    length < 0 or length > attention_mask.shape[1] for length in text_lengths
+                ):
+                    raise ValueError("Text lengths must match the mask batch and padded width")
+                seqlens = torch.tensor(
+                    [img_len + length for length in text_lengths], device=attention_mask.device, dtype=torch.int32
+                )
+            else:
+                seqlens = attention_mask.sum(dim=1).to(torch.int32) + img_len  # [B]
             max_seqlen = attention_mask.shape[1] + img_len
 
             if split_attn:
                 # cu_seqlens is not needed for split attention
                 return AttentionParams(attn_mode, split_attn, img_len, attention_mask, seqlens, None, max_seqlen)
+
+            if attn_mode == "torch":
+                # Resolve trimming once outside the blocks/checkpoint replay.
+                # Krea2 training supplies CPU shape metadata and needs no readback.
+                lengths = (
+                    tuple(img_len + length for length in text_lengths)
+                    if text_lengths is not None
+                    else tuple(seqlens.cpu().tolist())
+                )
+                uniform = lengths[0] if lengths and all(length == lengths[0] for length in lengths) else None
+                mask = torch.nn.functional.pad(attention_mask, (img_len, 0), value=True)[:, None, None, :].bool()
+                return AttentionParams(attn_mode, split_attn, img_len, mask, seqlens, None, max_seqlen, True, uniform)
 
             # Convert attention mask to cumulative sequence lengths for flash attention
             batch_size = attention_mask.shape[0]
@@ -131,8 +158,11 @@ def attention(
         and attn_params.seqlens is not None
         and (attn_params.attn_mode != "flash" and attn_params.attn_mode != "sageattn")
     ):
-        if torch.all(attn_params.seqlens == attn_params.seqlens[0]):
-            seqlen = attn_params.seqlens[0].item()
+        if attn_params.lengths_known:
+            seqlen = attn_params.uniform_seqlen
+        else:
+            seqlen = attn_params.seqlens[0].item() if torch.all(attn_params.seqlens == attn_params.seqlens[0]) else None
+        if seqlen is not None:
             q = q[:, :seqlen]
             k = k[:, :seqlen]
             v = v[:, :seqlen]

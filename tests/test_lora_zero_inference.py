@@ -45,6 +45,28 @@ class ZeroMultiplierInferenceTests(unittest.TestCase):
             self.assertEqual(torch.count_nonzero(parameter.grad).item(), 0)
         self.assertIsNotNone(x.grad)
 
+    def test_frozen_zero_ema_skips_projections_without_changing_input_or_policy_gradients(self):
+        torch.manual_seed(19)
+        base = nn.Linear(4, 6).requires_grad_(False)
+        policy = LoRAModule("policy", base, lora_dim=2)
+        policy.apply_to()
+        ema = LoRAModule("ema", base, multiplier=0.0, lora_dim=2)
+        ema.apply_to()
+        ema.eval().requires_grad_(False)
+        with torch.no_grad():
+            policy.lora_up.weight.normal_()
+            ema.lora_up.weight.normal_()
+        x = torch.randn(2, 3, 4, requires_grad=True)
+        params = (x, *policy.parameters())
+        expected = ema.org_forward(x) + ema.lora_up(ema.lora_down(x)) * 0.0
+        expected_grads = torch.autograd.grad(expected.square().mean(), params)
+        with patch.object(ema.lora_down, "forward", side_effect=AssertionError("inactive EMA ran")):
+            actual = base(x)
+            actual_grads = torch.autograd.grad(actual.square().mean(), params)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+
     def test_training_no_grad_retains_dropout_rng_behavior(self):
         base = nn.Linear(4, 6)
         adapter = LoRAModule("test", base, multiplier=0.0, dropout=0.5)

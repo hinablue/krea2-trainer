@@ -28,6 +28,7 @@ from krea2_trainer.dataset.architectures import (
 )
 from krea2_trainer.dataset.media_utils import divisible_by
 from krea2_trainer.utils.model_utils import remove_dtype_suffix
+from krea2_trainer.dataset.tensor_cache import load_cached_tensors
 
 if TYPE_CHECKING:
     from krea2_trainer.dataset.image_video_dataset import ItemInfo
@@ -175,6 +176,9 @@ class BucketBatchManager:
         self.bucket_resos.sort()
         self.num_timestep_buckets = num_timestep_buckets
         self.timestep_pool = None
+        # Preference datasets remain disk-backed. TQD's repeated samples get a
+        # bounded cache per loader worker; refreshed files invalidate on stat.
+        self._cache_tensors = any(item.tqd_structure_score is not None for items in self.buckets.values() for item in items)
 
         # indices for enumerating batches. each batch is reso + batch_idx. reso is (width, height) or (width, height, frames)
         self.bucket_batch_indices: list[tuple[tuple[Any], int]] = []
@@ -237,6 +241,9 @@ class BucketBatchManager:
         return len(self.bucket_batch_indices)
 
     def __getitem__(self, idx):
+        return self.load_batch(idx)
+
+    def load_batch(self, idx, *, latents_only=False):
         bucket_reso, batch_idx = self.bucket_batch_indices[idx]
         bucket = self.buckets[bucket_reso]
         start = batch_idx * self.batch_size
@@ -247,8 +254,9 @@ class BucketBatchManager:
         tqd_structure_scores = []
         tqd_detail_scores = []
         for item_info in bucket[start:end]:
-            sd_latent = load_file(item_info.latent_cache_path)
-            sd_te = load_file(item_info.text_encoder_output_cache_path)
+            load = load_cached_tensors if self._cache_tensors else load_file
+            sd_latent = load(item_info.latent_cache_path)
+            sd_te = {} if latents_only else load(item_info.text_encoder_output_cache_path)
             sd = {**sd_latent, **sd_te}
 
             # TODO refactor this
@@ -288,6 +296,9 @@ class BucketBatchManager:
                 raise ValueError("TQD scores must be configured for every item in a batch")
             batch_tensor_data["tqd_structure_score"] = torch.tensor(tqd_structure_scores, dtype=torch.float32)
             batch_tensor_data["tqd_detail_score"] = torch.tensor(tqd_detail_scores, dtype=torch.float32)
+            # Immutable CPU metadata survives Accelerator device placement and
+            # keys the trainer's small distribution/weight cache without D2H.
+            batch_tensor_data["tqd_score_values"] = tuple(zip(tqd_structure_scores, tqd_detail_scores))
 
         if self.timestep_pool is not None:
             batch_tensor_data["timesteps"] = self.timestep_pool[idx][: end - start]  # use the pre-generated timesteps

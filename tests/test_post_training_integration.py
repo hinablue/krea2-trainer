@@ -22,7 +22,7 @@ def run_fixture(mode, directory, encoding="varlen"):
     from safetensors.torch import load_file, save_file
     from krea2_trainer.krea2.krea2_mmdit import SingleMMDiTConfig, SingleStreamDiT
     from krea2_trainer.krea2 import krea2_utils
-    from krea2_trainer.krea2_train_network import main as training_main
+    from krea2_trainer.krea2_train_network import main as training_main, Krea2NetworkTrainer
     from krea2_trainer.krea2_post_training import Krea2PostTrainingTrainer
     from krea2_trainer.networks.lora_krea2 import create_arch_network
 
@@ -32,6 +32,9 @@ def run_fixture(mode, directory, encoding="varlen"):
 
         trainer_class = Krea2FlowCPOTrainer
         trainer_patch = "krea2_trainer.krea2_flow_cpo.Krea2FlowCPOTrainer"
+    elif mode == "tqd":
+        trainer_class = Krea2NetworkTrainer
+        trainer_patch = "krea2_trainer.krea2_train_network.Krea2NetworkTrainer"
     else:
         trainer_class = Krea2PostTrainingTrainer
         trainer_patch = "krea2_trainer.krea2_post_training.Krea2PostTrainingTrainer"
@@ -88,9 +91,12 @@ def run_fixture(mode, directory, encoding="varlen"):
                 + "\n"
             )
     dataset = directory / "dataset.toml"
+    scores = directory / "scores.jsonl"
+    scores.write_text("".join(json.dumps(dict(image_file=f"{name}.png", structure_score=0.8, detail_score=0.3)) + "\n" for name in names))
     dataset.write_text(
         "[general]\nresolution=[32,32]\nbatch_size=1\nenable_bucket=false\n"
         f'[[datasets]]\nimage_directory="{images}"\ncache_directory="{cache}"\nnum_repeats=1\n'
+        + (f'tqd_score_file="{scores}"\n' if mode == "tqd" else "")
     )
     cli_args = [
         "--post_training",
@@ -135,6 +141,12 @@ def run_fixture(mode, directory, encoding="varlen"):
         "fixture",
         "--save_state",
     ]
+    if mode == "tqd":
+        for flag in ("--post_training", "--preference_manifest", "--preference_batch_size", "--reference_lora"):
+            index = cli_args.index(flag)
+            del cli_args[index:index + 2]
+        cli_args[cli_args.index("--timestep_sampling") + 1] = "tqd_krea2_shift"
+        cli_args += ["--tqd_quality_weighting"]
     if mode == "flow_cpo":
         cli_args += [
             "--gradient_accumulation_steps",
@@ -209,18 +221,19 @@ def run_fixture(mode, directory, encoding="varlen"):
         raise AssertionError("Optimizer failed to update zero-initialized incremental adapter")
     for key, value in model.state_dict().items():
         torch.testing.assert_close(value.cpu(), initial[key].to(value.dtype), rtol=0, atol=0)
-    reference = trainer.reference_network
-    for key, value in reference.state_dict().items():
-        torch.testing.assert_close(value.cpu(), load_file(str(stage1_path))[key], rtol=0, atol=0)
-    if any(parameter.grad is not None or parameter.requires_grad for parameter in reference.parameters()):
-        raise AssertionError("Reference adapter was not frozen")
+    reference = getattr(trainer, "reference_network", None)
+    if reference is not None:
+        for key, value in reference.state_dict().items():
+            torch.testing.assert_close(value.cpu(), load_file(str(stage1_path))[key], rtol=0, atol=0)
+        if any(parameter.grad is not None or parameter.requires_grad for parameter in reference.parameters()):
+            raise AssertionError("Reference adapter was not frozen")
     with safe_open(str(saved), framework="pt") as checkpoint:
         metadata = checkpoint.metadata()
-    if metadata["ss_post_training"] != mode or metadata["ss_steps"] != "2":
+    if (mode != "tqd" and metadata["ss_post_training"] != mode) or metadata["ss_steps"] != "2":
         raise AssertionError("Post-training checkpoint provenance or completed steps missing")
     if metadata["ss_mixed_precision"] != "bf16":
         raise AssertionError("CLI precision was overridden by the environment")
-    state_files = list(output.glob("**/krea2_post_training_state.json"))
+    state_files = list(output.glob("**/optimizer.bin" if mode == "tqd" else "**/krea2_post_training_state.json"))
     if not state_files:
         raise AssertionError("Accelerator state omitted fixed-reference provenance sidecar")
     # Resume through the real Accelerator hooks with a fresh base+stage1 stack.
@@ -240,7 +253,9 @@ def run_fixture(mode, directory, encoding="varlen"):
             raise AssertionError("EMA state unexpectedly equals policy rather than tracking its history")
         if set(weights) != set(trainer.ema_network.state_dict()):
             raise AssertionError("Export contains non-policy adapter tensors")
-    original_contract = trainer.reference_contract
+    if mode == "tqd" and not trainer._tqd_score_cache._entries:
+        raise AssertionError("TQD CLI did not use prepared score parameters")
+    original_contract = getattr(trainer, "reference_contract", None)
     model = SingleStreamDiT(config)
     model.load_state_dict(initial)
     cli_args += ["--resume", str(state_files[0].parent), "--max_train_steps", "1", "--output_name", "fixture_resumed"]
@@ -255,10 +270,11 @@ def run_fixture(mode, directory, encoding="varlen"):
     resumed = load_file(str(output / "fixture_resumed.safetensors"))
     if not any(not torch.equal(weights[key], resumed[key]) for key in weights):
         raise AssertionError("Resumed optimizer made no additional update")
-    if trainer.reference_contract != original_contract:
+    if getattr(trainer, "reference_contract", None) != original_contract:
         raise AssertionError("Resume changed the original reference contract")
-    for key, value in trainer.reference_network.state_dict().items():
-        torch.testing.assert_close(value.cpu(), load_file(str(stage1_path))[key], rtol=0, atol=0)
+    if mode != "tqd":
+        for key, value in trainer.reference_network.state_dict().items():
+            torch.testing.assert_close(value.cpu(), load_file(str(stage1_path))[key], rtol=0, atol=0)
     if mode == "flow_cpo":
         if resumed_ema_events != [False, True] or trainer.ema_updates != 3:
             raise AssertionError("Resume failed to continue EMA history across accumulation")
@@ -300,7 +316,7 @@ class PostTrainingIntegrationTests(unittest.TestCase):
         self._training_loops("dense")
 
     def _training_loops(self, encoding):
-        for mode in ("rft", "flow_dpo", "flow_cpo"):
+        for mode in ("rft", "flow_dpo", "flow_cpo", "tqd"):
             with self.subTest(mode=mode, encoding=encoding), tempfile.TemporaryDirectory() as directory:
                 environment = dict(
                     os.environ,

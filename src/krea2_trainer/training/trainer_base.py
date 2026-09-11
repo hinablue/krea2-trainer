@@ -65,6 +65,7 @@ from krea2_trainer.training.timesteps import (
     get_sigmas,
     normalized_tqd_quality_weights,
     sample_structure_detail_tqd,
+    TQDScoreCache,
 )
 
 logger = logging.getLogger(__name__)
@@ -183,6 +184,7 @@ class NetworkTrainer:
         self.num_timestep_buckets: Optional[int] = None  # for get_bucketed_timestep()
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4, except Qwen-Image-Layered
         self.default_discrete_flow_shift = 14.5  # default value for discrete flow shift for all models TODO may be None is better
+        self._tqd_score_cache = TQDScoreCache()
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -588,6 +590,7 @@ class NetworkTrainer:
         dtype: torch.dtype,
         tqd_structure_scores: Optional[torch.Tensor] = None,
         tqd_detail_scores: Optional[torch.Tensor] = None,
+        tqd_prepared=None,
     ):
         batch_size = noise.shape[0]
 
@@ -680,6 +683,7 @@ class NetworkTrainer:
                         kappa_base=args.tqd_kappa_base,
                         kappa_max=args.tqd_kappa_max,
                         sigmoid_scale=args.sigmoid_scale,
+                        prepared=tqd_prepared,
                     )
                     h, w = latents.shape[-2:]
                     mu = train_utils.get_lin_function(x1=256, y1=0.5, x2=6400, y2=1.15)((h // 2) * (w // 2))
@@ -1251,6 +1255,13 @@ class NetworkTrainer:
 
         ``latents`` is already scale-shifted; ``noise`` is already sampled.
         """
+        tqd_prepared = None
+        if args.timestep_sampling == "tqd_krea2_shift" and "tqd_score_values" in batch:
+            if len(batch["tqd_score_values"]) != latents.shape[0]:
+                raise ValueError("TQD score metadata must match the training batch")
+            tqd_prepared = self._tqd_score_cache.get(
+                batch["tqd_score_values"], accelerator.device, args.tqd_kappa_base, args.tqd_kappa_max
+            )
         noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
             args,
             noise,
@@ -1261,6 +1272,7 @@ class NetworkTrainer:
             dit_dtype,
             tqd_structure_scores=batch.get("tqd_structure_score"),
             tqd_detail_scores=batch.get("tqd_detail_score"),
+            tqd_prepared=tqd_prepared,
         )
 
         output = self.call_dit(args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype)
@@ -1268,26 +1280,29 @@ class NetworkTrainer:
         if args.tqd_quality_weighting:
             if "tqd_structure_score" not in batch or "tqd_detail_score" not in batch:
                 raise ValueError("tqd_quality_weighting requires TQD structure/detail scores in every training batch")
-            sample_weights = normalized_tqd_quality_weights(
-                batch["tqd_structure_score"].to(device=accelerator.device),
-                batch["tqd_detail_score"].to(device=accelerator.device),
-            )
+            if tqd_prepared is not None:
+                if tqd_prepared.weights is None:
+                    raise ValueError("TQD quality weights require at least one non-zero structure or detail score per batch")
+                sample_weights = tqd_prepared.weights
+            else:
+                sample_weights = normalized_tqd_quality_weights(
+                    batch["tqd_structure_score"].to(device=accelerator.device),
+                    batch["tqd_detail_score"].to(device=accelerator.device),
+                )
+            if sample_weights.numel() == 1:
+                # Already validated above: q / mean(q) is exactly one for B=1.
+                sample_weights = None
         loss, loss_metrics = self.compute_loss(
             args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step, sample_weights=sample_weights
         )
-        if args.timestep_sampling == "tqd_krea2_shift":
+        if args.timestep_sampling == "tqd_krea2_shift" and getattr(accelerator, "trackers", ()):
             structure = batch["tqd_structure_score"].to(device=accelerator.device, dtype=torch.float32)
             detail = batch["tqd_detail_score"].to(device=accelerator.device, dtype=torch.float32)
             sampled_t = torch.as_tensor(timesteps, device=accelerator.device, dtype=torch.float32)
             sampled_t = (sampled_t - 1.0) / 1000.0
-            loss_metrics.update(
-                {
-                    "tqd/structure_mean": structure.mean().item(),
-                    "tqd/detail_mean": detail.mean().item(),
-                    "tqd/timestep_mean": sampled_t.mean().item(),
-                    "tqd/timestep_std": sampled_t.std(unbiased=False).item(),
-                }
-            )
+            names = ("tqd/structure_mean", "tqd/detail_mean", "tqd/timestep_mean", "tqd/timestep_std")
+            values = torch.stack((structure.mean(), detail.mean(), sampled_t.mean(), sampled_t.std(unbiased=False)))
+            loss_metrics.update(zip(names, values.detach().cpu().tolist()))
         return loss, loss_metrics
 
     def compute_loss(
@@ -1317,8 +1332,20 @@ class NetworkTrainer:
         (e.g. ``{"loss/gen": ..., "loss/rep": ...}``).
         """
         weighting = compute_loss_weighting_for_sd3(args.weighting_scheme, noise_scheduler, timesteps, timesteps.device, dit_dtype)
-        loss = torch.nn.functional.mse_loss(output.pred.to(network_dtype), output.target, reduction="none")
-        if weighting is not None:
+        prediction = output.pred.to(network_dtype)
+        if weighting is None and sample_weights is None:
+            return torch.nn.functional.mse_loss(prediction, output.target, reduction="mean"), {}
+        loss = torch.nn.functional.mse_loss(prediction, output.target, reduction="none")
+        # Current SD3 weights are constant within an image. Keep a fallback for
+        # extensions that supply spatial weights instead of per-image scalars.
+        per_image = weighting is None or (
+            weighting.ndim == loss.ndim and weighting.shape[0] == loss.shape[0] and all(size == 1 for size in weighting.shape[1:])
+        )
+        if per_image:
+            loss = loss.reshape(loss.shape[0], -1).mean(1)
+            if weighting is not None:
+                loss = loss * weighting.reshape(-1)
+        elif weighting is not None:
             loss = loss * weighting
         if sample_weights is not None:
             if sample_weights.ndim != 1 or sample_weights.shape[0] != loss.shape[0]:

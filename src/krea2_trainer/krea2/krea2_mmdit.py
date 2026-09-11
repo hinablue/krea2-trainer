@@ -8,6 +8,7 @@ prefix per sample — this lets the shared varlen / cu_seqlens machinery handle 
 """
 
 import math
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
@@ -71,6 +72,16 @@ class SingleMMDiTConfig:
     txtlayers: int = 1
     txtheads: int = 20
     txtkvheads: int = 20
+
+
+@dataclass(frozen=True)
+class TrainingAttentionMetadata:
+    text: AttentionParams
+    combined: AttentionParams
+    freqs: Tensor
+    padlen: int
+    paired: bool
+    image_only_head: bool = True
 
 
 class SimpleModulation(torch.nn.Module):
@@ -346,6 +357,64 @@ class SingleStreamDiT(nn.Module):
         self.gradient_checkpointing = False
         self.blocks_to_swap = 0
         self.offloader = None
+        # Geometry only: never cache activations affected by model/LoRA weights.
+        # Not buffers, so native checkpoints retain exactly the same keys.
+        self._training_metadata_cache = OrderedDict()
+
+    def _apply(self, fn, recurse=True):
+        self._training_metadata_cache.clear()
+        return super()._apply(fn, recurse=recurse)
+
+    @torch.no_grad()
+    def prepare_training_metadata(
+        self, height, width, text_lengths, device, *, paired=False, pad_to_multiple=256, image_only_head=True
+    ):
+        """Cache masks, CPU lengths and RoPE for at most eight training shapes."""
+        text_lengths = tuple(text_lengths)
+        device = torch.device(device)
+        key = (
+            height,
+            width,
+            text_lengths,
+            device,
+            paired,
+            pad_to_multiple,
+            image_only_head,
+            self.attn_mode,
+            self.split_attn,
+            tuple(self.posemb.axdims),
+            self.posemb.theta,
+            self.posemb.ntk,
+        )
+        cached = self._training_metadata_cache.get(key)
+        if cached is not None:
+            self._training_metadata_cache.move_to_end(key)
+            return cached
+        imglen = height * width
+        max_text = max(text_lengths)
+        lengths = torch.tensor(text_lengths, device=device)
+        text_mask = torch.arange(max_text, device=device)[None, :] < lengths[:, None]
+        txt_params = AttentionParams.create_attention_params_from_mask(
+            self.attn_mode, self.split_attn, 0, text_mask, text_lengths=text_lengths
+        )
+        combined_lengths = text_lengths * (2 if paired else 1)
+        combined_mask = torch.cat((text_mask, text_mask)) if paired else text_mask
+        padlen = (-(imglen + max_text)) % pad_to_multiple
+        if padlen:
+            combined_mask = F.pad(combined_mask, (0, padlen), value=False)
+        main_params = AttentionParams.create_attention_params_from_mask(
+            self.attn_mode, self.split_attn, imglen, combined_mask, text_lengths=combined_lengths
+        )
+        # Coordinates are identical across the batch; RoPE broadcasts batch=1.
+        positions = torch.zeros(1, imglen + max_text + padlen, 3, device=device, dtype=torch.float32)
+        grid = positions[:, :imglen].view(height, width, 3)
+        grid[..., 1] = torch.arange(height, device=device)[:, None]
+        grid[..., 2] = torch.arange(width, device=device)[None, :]
+        metadata = TrainingAttentionMetadata(txt_params, main_params, self.posemb(positions), padlen, paired, image_only_head)
+        self._training_metadata_cache[key] = metadata
+        if len(self._training_metadata_cache) > 8:
+            self._training_metadata_cache.popitem(last=False)
+        return metadata
 
     def enable_gradient_checkpointing(self, cpu_offload: bool = False):
         # cpu_offload is accepted for interface parity; not implemented for K2 yet.
@@ -396,24 +465,38 @@ class SingleStreamDiT(nn.Module):
         img: Tensor,
         context: Tensor,
         t: Tensor,
-        pos: Tensor,
+        pos: Tensor | None,
         mask: Tensor | None = None,
+        training_metadata: TrainingAttentionMetadata | None = None,
     ) -> Tensor:
         img = self.first(img)
+        paired = training_metadata is not None and training_metadata.paired
+        if paired:
+            if img.shape[0] != 2 * context.shape[0] or t.shape[0] != img.shape[0]:
+                raise ValueError("Paired conditioning requires one context per chosen/rejected pair")
+            t = t[: context.shape[0]]
         t = self.tmlp(temb(t, self.config.tdim, device=img.device, dtype=img.dtype))
         tvec = self.tproj(t)
 
         # `mask`/`pos` arrive in image-first order: [img (all valid), text (valid prefix + pad)].
         # The text-only key-padding mask is therefore the tail beyond the image tokens.
         imglen = img.shape[1]
-        txtmask = mask[:, imglen:]  # (B, txt_len) bool
+        txtmask = mask[:, imglen:] if training_metadata is None else None
 
         # Text fusion is a self-attention over text tokens only (img_len=0). The per-layer
         # blocks see every token (no mask); the refiner masks padding via txtmask.
         txt_attn_params_nomask = AttentionParams.create_attention_params_from_mask(self.attn_mode, self.split_attn, 0, None)
-        txt_attn_params = AttentionParams.create_attention_params_from_mask(self.attn_mode, self.split_attn, 0, txtmask)
+        txt_attn_params = (
+            AttentionParams.create_attention_params_from_mask(self.attn_mode, self.split_attn, 0, txtmask)
+            if training_metadata is None
+            else training_metadata.text
+        )
         context = self.txtfusion(context, txt_attn_params_nomask, txt_attn_params)
         context = self.txtmlp(context)
+        if paired:
+            # cat retains autograd: both images contribute to the same branch.
+            context = torch.cat((context, context))
+            t, tvec = torch.cat((t, t)), torch.cat((tvec, tvec))
 
         combined = torch.cat((img, context), dim=1)  # image first, then text
 
@@ -421,18 +504,21 @@ class SingleStreamDiT(nn.Module):
         # The pad lands on the text tail; extending txtmask with False makes the shared attention
         # machinery (cu_seqlens / key-padding mask / trim) exclude it, so it is numerically inert.
         fulllen = combined.shape[1]
-        padlen = (-fulllen) % 256
+        padlen = (-fulllen) % 256 if training_metadata is None else training_metadata.padlen
         if padlen > 0:
             combined = F.pad(combined, (0, 0, 0, padlen))
-            pos = F.pad(pos, (0, 0, 0, padlen))
-            txtmask = F.pad(txtmask, (0, padlen), value=False)
+            if training_metadata is None:
+                pos = F.pad(pos, (0, 0, 0, padlen))
+                txtmask = F.pad(txtmask, (0, padlen), value=False)
 
         # Main blocks: bidirectional attention over [image (img_len, all valid) + text (padded)].
         # Image-first ordering keeps each sample's valid tokens a contiguous prefix, which the
         # shared varlen path requires.
-        attn_params = AttentionParams.create_attention_params_from_mask(self.attn_mode, self.split_attn, imglen, txtmask)
-
-        freqs = self.posemb(pos)
+        if training_metadata is None:
+            attn_params = AttentionParams.create_attention_params_from_mask(self.attn_mode, self.split_attn, imglen, txtmask)
+            freqs = self.posemb(pos)
+        else:
+            attn_params, freqs = training_metadata.combined, training_metadata.freqs
 
         for index, block in enumerate(self.blocks):
             if self.blocks_to_swap:
@@ -446,7 +532,8 @@ class SingleStreamDiT(nn.Module):
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.blocks, index)
 
-        final = self.last(combined, t)
-        output = final[:, :imglen, :]  # image tokens are the leading slice now
-
-        return output
+        # LastLayer is token-wise. Text/padding outputs never enter the loss.
+        # Preserve RNG tensor shapes for TQD adapters using dropout.
+        if training_metadata is not None and training_metadata.image_only_head:
+            return self.last(combined[:, :imglen, :], t)
+        return self.last(combined, t)[:, :imglen, :]

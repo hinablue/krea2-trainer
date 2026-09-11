@@ -21,6 +21,7 @@ Krea2 Trainer 是從 [`kohya-ss/musubi-tuner`](https://github.com/kohya-ss/musub
 - **既有 LoRA 的第二階段訓練**：先讀下方模式說明，再看 [RFT／FlowDPO 指南](docs/post-training.md) 或 [FlowCPO 指南](docs/flow-cpo.md)。
 - **環境與追蹤**：[W&B logging](#wb-logging)、[容器訓練](#容器訓練)、[疑難排解](#疑難排解)。
 - **驗證範圍**：[RFT／FlowDPO 驗證](docs/post-training-verification.md)、[FlowCPO 驗證](docs/flow-cpo-verification.md)。
+- **計算優化**：[CPO／TQD 優化項目、相容性與數值驗證](docs/training-compute-optimizations.md)。
 
 ## 訓練模式
 

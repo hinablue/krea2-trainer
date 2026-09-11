@@ -18,6 +18,8 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 import torch
 
+from krea2_trainer.utils.tensor_checks import all_finite
+
 
 FLOW_CPO_EMA_STATE = "krea2_flow_cpo_ema.safetensors"
 _EMA_VERSION = "1"
@@ -67,7 +69,7 @@ def flow_cpo_loss(policy_chosen, policy_rejected, old_chosen, old_rejected, targ
         raise ValueError("FlowCPO velocity tensors must have identical nonempty [pairs, ...] shapes")
     if any(value.device != device or value.layout != torch.strided or value.is_meta for value in values):
         raise ValueError("FlowCPO velocity tensors must be dense, materialized and on the same device")
-    if any(not torch.isfinite(value).all() for value in values):
+    if not all_finite(values):
         raise FloatingPointError("All six FlowCPO velocity branches must be finite")
 
     mu = (1 - beta) * old_chosen.detach().float() + beta * policy_chosen.float()
@@ -76,12 +78,13 @@ def flow_cpo_loss(policy_chosen, policy_rejected, old_chosen, old_rejected, targ
     rejected = (nu - target_rejected.float()).square().flatten(1).mean(1)
     loss = (chosen + loss_lambda * rejected).mean()
     chosen_mean, rejected_mean = chosen.detach().mean(), rejected.detach().mean()
-    if any(not torch.isfinite(value).all() for value in (chosen, rejected, loss, chosen_mean, rejected_mean)):
+    if not all_finite((chosen, rejected, loss, chosen_mean, rejected_mean)):
         raise FloatingPointError("Non-finite FP32 FlowCPO objective or branch MSE")
+    loss_value, chosen_value, rejected_value = torch.stack((loss.detach(), chosen_mean, rejected_mean)).cpu().tolist()
     return loss, {
-        "flow_cpo/loss": loss.detach().item(),
-        "flow_cpo/chosen_mse": chosen_mean.item(),
-        "flow_cpo/rejected_mse": rejected_mean.item(),
+        "flow_cpo/loss": loss_value,
+        "flow_cpo/chosen_mse": chosen_value,
+        "flow_cpo/rejected_mse": rejected_value,
     }
 
 
@@ -89,7 +92,8 @@ def _native_modules(network):
     if not isinstance(network, torch.nn.Module) or not getattr(network, "unet_loras", None):
         raise TypeError("FlowCPO requires an attached native Krea2 LoRA network")
     modules = list(network.modules())
-    if any(module not in modules or not hasattr(module, "org_forward") for module in network.unet_loras):
+    module_set = set(modules)
+    if any(module not in module_set or not hasattr(module, "org_forward") for module in network.unet_loras):
         raise ValueError("Attach the native LoRA network before constructing or selecting FlowCPO EMA")
     multipliers = [(module, module.multiplier) for module in modules if hasattr(module, "multiplier")]
     if not multipliers:
@@ -105,15 +109,17 @@ def _adapter_state(network, label):
     for key, value in parameters.items():
         if value.dtype != torch.float32 or value.ndim != 2 or not value.numel() or value.layout != torch.strided or value.is_meta:
             raise ValueError(f"{label} {key} must be a nonempty materialized FP32 parameter matrix")
-        if not torch.isfinite(value).all():
-            raise FloatingPointError(f"{label} {key} contains non-finite values")
+    if not all_finite(parameters.values()):
+        raise FloatingPointError(f"{label} matrices contain non-finite values")
     alphas = dict(network.named_buffers())
     expected_alphas = {key.rsplit(".lora_", 1)[0] + ".alpha" for key in parameters}
     if set(alphas) != expected_alphas:
         raise ValueError(f"{label} must contain exactly the corresponding LoRA alpha buffers")
     for key, value in alphas.items():
-        if value.ndim != 0 or value.is_meta or value.is_complex() or value.dtype == torch.bool or not torch.isfinite(value).all():
+        if value.ndim != 0 or value.is_meta or value.is_complex() or value.dtype == torch.bool:
             raise ValueError(f"{label} {key} must be a finite scalar alpha buffer")
+    if not all_finite(alphas.values()):
+        raise ValueError(f"{label} must contain finite scalar alpha buffers")
     return parameters, alphas
 
 
@@ -125,9 +131,26 @@ def _matching_parameters(parameters, expected):
 
 
 def _matching_alphas(alphas, expected):
-    if set(alphas) != set(expected) or any(
-        not torch.equal(alphas[key].detach().cpu(), expected[key].detach().cpu()) for key in expected
-    ):
+    if set(alphas) != set(expected):
+        raise ValueError("FlowCPO EMA alpha buffers must remain exactly equal to the initial policy alphas")
+    # Pack before copying: one transfer per device, not one per alpha scalar.
+    devices = {value.device for value in alphas.values()} | {value.device for value in expected.values()}
+    if len(devices) == 1:
+        same = torch.equal(torch.stack([alphas[key] for key in expected]), torch.stack(list(expected.values())))
+    else:
+
+        def packed_cpu(values):
+            groups = {}
+            for key, value in values.items():
+                groups.setdefault(value.device, []).append(key)
+            result = {}
+            for keys in groups.values():
+                packed = torch.stack([values[key].detach() for key in keys]).cpu()
+                result.update(zip(keys, packed.unbind()))
+            return torch.stack([result[key] for key in expected])
+
+        same = torch.equal(packed_cpu(alphas), packed_cpu(expected))
+    if not same:
         raise ValueError("FlowCPO EMA alpha buffers must remain exactly equal to the initial policy alphas")
 
 
@@ -194,14 +217,14 @@ class AdapterEMA:
         _matching_alphas(alphas, self._alphas)
         _independent_parameters(policy, old)
         self._validate_counters()
-        updated = {
-            key: value * self.decay + policy[key].detach().to(device=value.device, dtype=torch.float32) * (1 - self.decay)
-            for key, value in old.items()
-        }
-        if any(not torch.isfinite(value).all() for value in updated.values()):
+        destinations = list(old.values())
+        sources = [policy[key].detach().to(device=value.device, dtype=torch.float32) for key, value in old.items()]
+        # Keep two multiplies followed by an add, matching the original FP32
+        # rounding. lerp/add(alpha=...) can change the recurrence via fusion.
+        updated = torch._foreach_add(torch._foreach_mul(destinations, self.decay), torch._foreach_mul(sources, 1 - self.decay))
+        if not all_finite(updated):
             raise FloatingPointError("Non-finite FP32 FlowCPO EMA update")
-        for key, value in old.items():
-            value.copy_(updated[key])
+        torch._foreach_copy_(destinations, updated)
         self.updates += 1
 
     def _validate_counters(self):

@@ -140,13 +140,14 @@ class LoRAModule(torch.nn.Module):
 
         # Reference inference disables only this adapter. Keep org_forward above
         # so the base and any stacked stage-one adapter still run. Restrict the
-        # shortcut to eval/no-grad: training must retain zero gradients and its
-        # dropout RNG behavior. Scalar-only avoids tensor sync/gradient changes.
+        # shortcut to eval and either no-grad or frozen matrices. A frozen,
+        # inactive CPO EMA has no contribution to input gradients either.
+        # Trainable zero-multiplier adapters must still receive zero gradients.
         if (
             not self.training
-            and not torch.is_grad_enabled()
             and isinstance(self.multiplier, (int, float))
             and self.multiplier == 0
+            and (not torch.is_grad_enabled() or not any(parameter.requires_grad for parameter in self.parameters()))
         ):
             return org_forwarded
 

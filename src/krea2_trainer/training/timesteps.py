@@ -2,11 +2,80 @@
 
 import logging
 import math
+from collections import OrderedDict
+from dataclasses import dataclass
 
 import torch
 
 
 logger = logging.getLogger(__name__)
+
+
+def _checked_tqd_scores(structure_scores, detail_scores):
+    if structure_scores.shape != detail_scores.shape:
+        raise ValueError("TQD structure and detail score tensors must have matching shapes")
+    structure = structure_scores.to(dtype=torch.float32)
+    detail = detail_scores.to(device=structure.device, dtype=torch.float32)
+    invalid = ~torch.isfinite(structure) | ~torch.isfinite(detail) | (structure < 0) | (structure > 1) | (detail < 0) | (detail > 1)
+    if torch.any(invalid):
+        raise ValueError("TQD structure and detail scores must be finite and within [0, 1]")
+    return structure, detail
+
+
+def _tqd_distribution(structure, detail, kappa_base, kappa_max):
+    if not math.isfinite(kappa_base) or not math.isfinite(kappa_max) or kappa_base <= 0 or kappa_max < kappa_base:
+        raise ValueError("TQD requires finite kappa_base > 0 and kappa_max >= kappa_base")
+    if kappa_max > torch.finfo(torch.float32).max:
+        raise ValueError("TQD kappa_max must be representable in float32")
+    mu = 0.5 + 0.5 * (structure - detail)
+    kappa = kappa_base + (kappa_max - kappa_base) * (structure - detail).abs()
+    alpha = (mu * kappa).clamp_min(1e-4)
+    beta = ((1.0 - mu) * kappa).clamp_min(1e-4)
+    # Finite bounded scores and practical finite kappas make both positive.
+    # Reject float32 overflow before bypassing distribution-internal checks.
+    return torch.distributions.Beta(alpha, beta, validate_args=False)
+
+
+@dataclass(frozen=True)
+class PreparedTQDScores:
+    structure: torch.Tensor
+    detail: torch.Tensor
+    distribution: torch.distributions.Beta
+    weights: torch.Tensor | None
+
+
+class TQDScoreCache:
+    """Bounded, process-local cache keyed by actual immutable score values.
+
+    Cache distribution parameters, never random draws. Sampling remains on the
+    training device at the original point in the RNG stream.
+    """
+
+    def __init__(self, max_entries=256):
+        self.max_entries = max_entries
+        self._entries = OrderedDict()
+
+    @torch.no_grad()
+    def get(self, score_values, device, kappa_base, kappa_max):
+        values = tuple(tuple(pair) for pair in score_values)
+        key = (values, torch.device(device), kappa_base, kappa_max)
+        if key in self._entries:
+            self._entries.move_to_end(key)
+            return self._entries[key]
+        # The loader supplies Python score metadata, so validation is CPU-only.
+        if not values or any(len(pair) != 2 or any(not math.isfinite(x) or not 0 <= x <= 1 for x in pair) for pair in values):
+            raise ValueError("TQD structure and detail scores must be finite and within [0, 1]")
+        scores = torch.tensor(values, device=device, dtype=torch.float32)
+        structure, detail = scores[:, 0], scores[:, 1]
+        distribution = _tqd_distribution(structure, detail, kappa_base, kappa_max)
+        quality = torch.maximum(structure, detail)
+        mean_quality = quality.mean()
+        weights = None if mean_quality <= torch.finfo(torch.float32).eps else quality / mean_quality
+        result = PreparedTQDScores(structure, detail, distribution, weights)
+        self._entries[key] = result
+        if len(self._entries) > self.max_entries:
+            self._entries.popitem(last=False)
+        return result
 
 
 def compute_ideogram4_shift_timestep(
@@ -36,13 +105,7 @@ def compute_ideogram4_shift_timestep(
 
 def normalized_tqd_quality_weights(structure_scores: torch.Tensor, detail_scores: torch.Tensor) -> torch.Tensor:
     """Return mean-one deterministic weights approximating TQD sample retention."""
-    if structure_scores.shape != detail_scores.shape:
-        raise ValueError("TQD structure and detail score tensors must have matching shapes")
-
-    structure = structure_scores.to(dtype=torch.float32)
-    detail = detail_scores.to(device=structure.device, dtype=torch.float32)
-    if torch.any((structure < 0.0) | (structure > 1.0) | (detail < 0.0) | (detail > 1.0)):
-        raise ValueError("TQD structure and detail scores must be within [0, 1]")
+    structure, detail = _checked_tqd_scores(structure_scores, detail_scores)
 
     quality = torch.maximum(structure, detail)
     mean_quality = quality.mean()
@@ -59,6 +122,7 @@ def sample_structure_detail_tqd(
     kappa_max: float,
     sigmoid_scale: float,
     cdf_samples: torch.Tensor | None = None,
+    prepared: PreparedTQDScores | None = None,
 ) -> torch.Tensor:
     """Sample Krea2's pre-shift timestep from per-sample structure/detail scores.
 
@@ -66,24 +130,14 @@ def sample_structure_detail_tqd(
     ``kappa_base == 2``, it is uniform; applying the inverse normal CDF then
     reproduces Krea2's native logit-normal sample before resolution shifting.
     """
-    if structure_scores.shape != detail_scores.shape:
-        raise ValueError("TQD structure and detail score tensors must have matching shapes")
-    if kappa_base <= 0.0 or kappa_max < kappa_base:
-        raise ValueError("TQD requires kappa_base > 0 and kappa_max >= kappa_base")
-
-    structure = structure_scores.to(dtype=torch.float32)
-    detail = detail_scores.to(device=structure.device, dtype=torch.float32)
-    if torch.any((structure < 0.0) | (structure > 1.0) | (detail < 0.0) | (detail > 1.0)):
-        raise ValueError("TQD structure and detail scores must be within [0, 1]")
-
-    mu = 0.5 + 0.5 * (structure - detail)
-    quality_gap = (structure - detail).abs()
-    kappa = kappa_base + (kappa_max - kappa_base) * quality_gap
+    if prepared is None:
+        structure, detail = _checked_tqd_scores(structure_scores, detail_scores)
+        distribution = _tqd_distribution(structure, detail, kappa_base, kappa_max)
+    else:
+        structure, distribution = prepared.structure, prepared.distribution
 
     if cdf_samples is None:
-        alpha = (mu * kappa).clamp_min(1e-4)
-        beta = ((1.0 - mu) * kappa).clamp_min(1e-4)
-        cdf_samples = torch.distributions.Beta(alpha, beta).sample()
+        cdf_samples = distribution.sample()
     else:
         if cdf_samples.shape != structure.shape:
             raise ValueError("TQD CDF samples must match the score tensor shape")
