@@ -789,6 +789,10 @@ def main():
 
     if args.post_training == "none":
         trainer = Krea2NetworkTrainer()
+    elif args.post_training == "flow_cpo":
+        from krea2_trainer.krea2_flow_cpo import Krea2FlowCPOTrainer
+
+        trainer = Krea2FlowCPOTrainer()
     else:
         from krea2_trainer.krea2_post_training import Krea2PostTrainingTrainer
 

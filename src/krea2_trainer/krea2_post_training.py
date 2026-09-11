@@ -237,6 +237,55 @@ class Krea2PostTrainingTrainer(Krea2NetworkTrainer):
             metadata["ss_flow_dpo_objective"] = "mean-fp32-velocity-mse-beta-over-2-uniform"
         return metadata
 
+    def _prepare_paired_batch(self, args, accelerator, batch, latents, noise, dit_dtype, network_dtype):
+        """Shared strict FlowDPO/FlowCPO input convention; no objective logic."""
+        method = "FlowCPO" if args.post_training == "flow_cpo" else "FlowDPO"
+        if batch.get("timesteps") is not None:
+            raise ValueError(f"{method} requires freshly sampled uniform timesteps, not dataset timestep buckets")
+        if any(key.startswith("tqd_") for key in batch):
+            raise ValueError(f"{method} batches cannot contain TQD scores or weights")
+        rejected = batch.get("rejected_latents")
+        if not isinstance(latents, torch.Tensor) or not isinstance(rejected, torch.Tensor) or latents.shape != rejected.shape:
+            raise ValueError(f"{method} chosen and rejected latents must have identical shapes")
+        if latents.ndim != 5 or latents.shape[2] != 1 or latents.shape[0] == 0 or latents.numel() == 0:
+            raise ValueError(f"{method} requires nonempty single-frame latents [pairs, C, 1, H, W]")
+        if not isinstance(noise, torch.Tensor) or noise.shape != latents.shape:
+            raise ValueError(f"{method} shared noise must match chosen latents")
+        pairs = latents.shape[0]
+        embeds = batch.get("krea2_vl_embed")
+        if isinstance(embeds, torch.Tensor):
+            if embeds.ndim != 4 or any(size <= 0 for size in embeds.shape):
+                raise ValueError(f"{method} dense krea2_vl_embed must be nonempty [pairs, tokens, layers, hidden]")
+            # Normalize dense native caches without changing varlen list semantics.
+            embeds = list(embeds.unbind(0))
+        if not isinstance(embeds, (list, tuple)) or len(embeds) != pairs:
+            raise ValueError(f"{method} requires one shared krea2_vl_embed per preference pair")
+        if any(
+            not isinstance(embed, torch.Tensor) or embed.ndim != 3 or any(size <= 0 for size in embed.shape) for embed in embeds
+        ):
+            raise ValueError(f"{method} krea2_vl_embed items must be nonempty tensors [tokens, layers, hidden]")
+        if args.post_training == "flow_cpo":
+            for value in (latents, rejected, noise, *embeds):
+                if not value.is_floating_point():
+                    raise ValueError("FlowCPO batch tensors must be floating point")
+                if not torch.isfinite(value).all():
+                    raise FloatingPointError("FlowCPO batch tensors must be finite")
+        device = accelerator.device
+        chosen = latents.to(device=device, dtype=network_dtype)
+        rejected = self.scale_shift_latents(rejected).to(device=device, dtype=network_dtype)
+        combined = torch.cat((chosen, rejected))
+        noise = noise.to(device=device, dtype=network_dtype)
+        paired_noise = torch.cat((noise, noise))
+        t = torch.rand(pairs, device=device, dtype=torch.float32)
+        paired_t = torch.cat((t, t))
+        broadcast_t = paired_t.view(-1, 1, 1, 1, 1)
+        noisy = ((1.0 - broadcast_t) * combined + broadcast_t * paired_noise).to(dtype=dit_dtype)
+        # call_dit divides model time by 1000; interpolation uses unshifted t.
+        timesteps = 1000.0 * paired_t + 1.0
+        # call_dit re-reads batch['latents'], not only its positional argument.
+        pair_batch = dict(batch, latents=combined, krea2_vl_embed=list(embeds) + list(embeds), timesteps=None)
+        return pairs, t, combined, pair_batch, paired_noise, noisy, timesteps
+
     def process_batch(
         self,
         args,
@@ -272,46 +321,9 @@ class Krea2PostTrainingTrainer(Krea2NetworkTrainer):
             )
         if args.post_training != "flow_dpo":
             raise ValueError("Unknown post-training method")
-        if batch.get("timesteps") is not None:
-            raise ValueError("FlowDPO requires freshly sampled uniform timesteps, not dataset timestep buckets")
-        if any(key.startswith("tqd_") for key in batch):
-            raise ValueError("FlowDPO batches cannot contain TQD scores or weights")
-        rejected = batch.get("rejected_latents")
-        if not isinstance(rejected, torch.Tensor) or latents.shape != rejected.shape:
-            raise ValueError("FlowDPO chosen and rejected latents must have identical shapes")
-        if latents.ndim != 5 or latents.shape[2] != 1 or latents.shape[0] == 0 or latents.numel() == 0:
-            raise ValueError("FlowDPO requires nonempty single-frame latents [pairs, C, 1, H, W]")
-        if noise.shape != latents.shape:
-            raise ValueError("FlowDPO shared noise must match chosen latents")
-        pairs = latents.shape[0]
-        embeds = batch.get("krea2_vl_embed")
-        if isinstance(embeds, torch.Tensor):
-            if embeds.ndim != 4 or any(size <= 0 for size in embeds.shape):
-                raise ValueError("FlowDPO dense krea2_vl_embed must be nonempty [pairs, tokens, layers, hidden]")
-            # Native cache loading stacks dense conditioning but retains lists
-            # for varlen caches. Normalize both to shared per-pair tensors.
-            embeds = list(embeds.unbind(0))
-        if not isinstance(embeds, (list, tuple)) or len(embeds) != pairs:
-            raise ValueError("FlowDPO requires one shared krea2_vl_embed per preference pair")
-        if any(
-            not isinstance(embed, torch.Tensor) or embed.ndim != 3 or any(size <= 0 for size in embed.shape) for embed in embeds
-        ):
-            raise ValueError("FlowDPO krea2_vl_embed items must be nonempty tensors [tokens, layers, hidden]")
-        device = accelerator.device
-        chosen = latents.to(device=device, dtype=network_dtype)
-        rejected = self.scale_shift_latents(rejected).to(device=device, dtype=network_dtype)
-        combined = torch.cat((chosen, rejected))
-        noise = noise.to(device=device, dtype=network_dtype)
-        paired_noise = torch.cat((noise, noise))
-        t = torch.rand(pairs, device=device, dtype=torch.float32)
-        paired_t = torch.cat((t, t))
-        broadcast_t = paired_t.view(-1, 1, 1, 1, 1)
-        noisy = ((1.0 - broadcast_t) * combined + broadcast_t * paired_noise).to(dtype=dit_dtype)
-        # Retain the native trainer's model-time convention. call_dit divides
-        # by 1000; the interpolant above uses t, not (1000*t+1)/1000.
-        timesteps = 1000.0 * paired_t + 1.0
-        # call_dit deliberately re-reads batch['latents'], not its argument.
-        pair_batch = dict(batch, latents=combined, krea2_vl_embed=list(embeds) + list(embeds), timesteps=None)
+        pairs, t, combined, pair_batch, paired_noise, noisy, timesteps = self._prepare_paired_batch(
+            args, accelerator, batch, latents, noise, dit_dtype, network_dtype
+        )
         policy_network = accelerator.unwrap_model(network)
         base_model = accelerator.unwrap_model(transformer)
         with reference_adapter_context(policy_network, base_model):

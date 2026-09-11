@@ -26,6 +26,16 @@ def run_fixture(mode, directory, encoding="varlen"):
     from krea2_trainer.krea2_post_training import Krea2PostTrainingTrainer
     from krea2_trainer.networks.lora_krea2 import create_arch_network
 
+    if mode == "flow_cpo":
+        from krea2_trainer.krea2_flow_cpo import Krea2FlowCPOTrainer
+        from krea2_trainer.training.flow_cpo import FLOW_CPO_EMA_STATE
+
+        trainer_class = Krea2FlowCPOTrainer
+        trainer_patch = "krea2_trainer.krea2_flow_cpo.Krea2FlowCPOTrainer"
+    else:
+        trainer_class = Krea2PostTrainingTrainer
+        trainer_patch = "krea2_trainer.krea2_post_training.Krea2PostTrainingTrainer"
+
     torch.set_num_threads(1)
     torch.manual_seed(41)
     directory = Path(directory)
@@ -47,7 +57,9 @@ def run_fixture(mode, directory, encoding="varlen"):
     stage1_path = directory / "stage1.safetensors"
     stage1.save_weights(str(stage1_path), torch.float32, {})
     text = torch.randn(3, 2, 8)
-    for name in ("winner", "loser"):
+    # Two distinct pairs allow an actual unsynchronized accumulation microstep.
+    names = ("winner", "loser", "winner2", "loser2") if mode == "flow_cpo" else ("winner", "loser")
+    for name in names:
         save_file({"latents_1x4x4_float32": torch.randn(2, 1, 4, 4)}, str(cache / f"{name}_0032x0032_kr2.safetensors"))
         save_file(
             {f"{'varlen_' if encoding == 'varlen' else ''}krea2_vl_embed_float32": text},
@@ -61,6 +73,20 @@ def run_fixture(mode, directory, encoding="varlen"):
         )
         + "\n"
     )
+    if mode == "flow_cpo":
+        with manifest.open("a") as handle:
+            handle.write(
+                json.dumps(
+                    dict(
+                        pair_id="fixture-pair-2",
+                        prompt="fixture portrait",
+                        chosen="winner2.png",
+                        rejected="loser2.png",
+                        split="train",
+                    )
+                )
+                + "\n"
+            )
     dataset = directory / "dataset.toml"
     dataset.write_text(
         "[general]\nresolution=[32,32]\nbatch_size=1\nenable_bucket=false\n"
@@ -109,8 +135,57 @@ def run_fixture(mode, directory, encoding="varlen"):
         "fixture",
         "--save_state",
     ]
+    if mode == "flow_cpo":
+        cli_args += [
+            "--gradient_accumulation_steps",
+            "2",
+            "--flow_cpo_beta",
+            "0.5",
+            "--flow_cpo_lambda",
+            "1",
+            "--flow_cpo_ema_decay",
+            "0.99",
+        ]
     initial = {key: value.clone() for key, value in model.state_dict().items()}
-    trainer = Krea2PostTrainingTrainer()
+    trainer = trainer_class()
+
+    def instrument_ema(candidate, expected_updates, expected_ema=None):
+        events = []
+        if mode != "flow_cpo":
+            return events
+        original_start = candidate.on_train_start
+        original_step = candidate.on_post_optimizer_step
+
+        def checked_start(*args, **kwargs):
+            original_start(*args, **kwargs)
+            if candidate.ema_updates != expected_updates:
+                raise AssertionError("EMA update counter reset or failed to resume")
+            if expected_ema is not None:
+                for key, value in candidate.ema_network.named_parameters():
+                    torch.testing.assert_close(value.cpu(), expected_ema[key], rtol=0, atol=0)
+
+        def checked_step(args, accelerator, network, transformer, sync_gradients, global_step):
+            before = {key: value.detach().clone() for key, value in candidate.ema_network.named_parameters()}
+            count = candidate.ema_updates
+            should_update = sync_gradients and accelerator.sync_gradients and not accelerator.optimizer_step_was_skipped
+            original_step(args, accelerator, network, transformer, sync_gradients, global_step)
+            if candidate.ema_updates != count + int(should_update):
+                raise AssertionError("EMA updated at the wrong accumulation boundary")
+            policy_parameters = dict(accelerator.unwrap_model(network).named_parameters())
+            for key, value in candidate.ema_network.named_parameters():
+                expected = before[key]
+                if should_update:
+                    expected = expected * candidate.ema.decay + policy_parameters[key].detach() * (1 - candidate.ema.decay)
+                torch.testing.assert_close(value, expected, rtol=0, atol=0)
+                if value.requires_grad or value.grad is not None:
+                    raise AssertionError("EMA acquired gradients")
+            events.append(bool(should_update))
+
+        candidate.on_train_start = checked_start
+        candidate.on_post_optimizer_step = checked_step
+        return events
+
+    ema_events = instrument_ema(trainer, 0)
 
     # Fixture replaces only model loading; real dataset/trainer/DiT forward,
     # gradient checkpointing, AdamW, Accelerator and checkpoint saving all run.
@@ -119,7 +194,7 @@ def run_fixture(mode, directory, encoding="varlen"):
 
     with (
         patch.object(krea2_utils, "load_krea2_dit", side_effect=load_tiny),
-        patch("krea2_trainer.krea2_post_training.Krea2PostTrainingTrainer", return_value=trainer),
+        patch(trainer_patch, return_value=trainer),
         patch.object(sys, "argv", ["krea2-train-lora", *cli_args]),
     ):
         training_main()
@@ -150,14 +225,30 @@ def run_fixture(mode, directory, encoding="varlen"):
         raise AssertionError("Accelerator state omitted fixed-reference provenance sidecar")
     # Resume through the real Accelerator hooks with a fresh base+stage1 stack.
     # max_train_steps follows the existing trainer's additional-run step counter.
+    saved_ema = None
+    if mode == "flow_cpo":
+        if ema_events != [False, True, False, True] or trainer.ema_updates != 2:
+            raise AssertionError(f"Unexpected EMA update schedule: {ema_events}")
+        ema_path = state_files[0].parent / FLOW_CPO_EMA_STATE
+        saved_ema = load_file(str(ema_path))
+        with safe_open(str(ema_path), framework="pt") as handle:
+            if handle.metadata()["updates"] != "2":
+                raise AssertionError("EMA saved count differs from completed steps")
+        for key, value in trainer.ema_network.named_parameters():
+            torch.testing.assert_close(value.cpu(), saved_ema[key], rtol=0, atol=0)
+        if not any(not torch.equal(weights[key], saved_ema[key]) for key in saved_ema):
+            raise AssertionError("EMA state unexpectedly equals policy rather than tracking its history")
+        if set(weights) != set(trainer.ema_network.state_dict()):
+            raise AssertionError("Export contains non-policy adapter tensors")
     original_contract = trainer.reference_contract
     model = SingleStreamDiT(config)
     model.load_state_dict(initial)
     cli_args += ["--resume", str(state_files[0].parent), "--max_train_steps", "1", "--output_name", "fixture_resumed"]
-    trainer = Krea2PostTrainingTrainer()
+    trainer = trainer_class()
+    resumed_ema_events = instrument_ema(trainer, 2, saved_ema)
     with (
         patch.object(krea2_utils, "load_krea2_dit", side_effect=load_tiny),
-        patch("krea2_trainer.krea2_post_training.Krea2PostTrainingTrainer", return_value=trainer),
+        patch(trainer_patch, return_value=trainer),
         patch.object(sys, "argv", ["krea2-train-lora", *cli_args]),
     ):
         training_main()
@@ -168,6 +259,19 @@ def run_fixture(mode, directory, encoding="varlen"):
         raise AssertionError("Resume changed the original reference contract")
     for key, value in trainer.reference_network.state_dict().items():
         torch.testing.assert_close(value.cpu(), load_file(str(stage1_path))[key], rtol=0, atol=0)
+    if mode == "flow_cpo":
+        if resumed_ema_events != [False, True] or trainer.ema_updates != 3:
+            raise AssertionError("Resume failed to continue EMA history across accumulation")
+        resumed_states = []
+        for path in output.glob("**/" + FLOW_CPO_EMA_STATE):
+            with safe_open(str(path), framework="pt") as handle:
+                if handle.metadata()["updates"] == "3":
+                    resumed_states.append(path)
+        if len(resumed_states) != 1:
+            raise AssertionError("Resume omitted its updated EMA state")
+        resumed_ema = load_file(str(resumed_states[0]))
+        for key, value in trainer.ema_network.named_parameters():
+            torch.testing.assert_close(value.cpu(), resumed_ema[key], rtol=0, atol=0)
     print(
         "FIXTURE_RESULT="
         + json.dumps(
@@ -181,6 +285,8 @@ def run_fixture(mode, directory, encoding="varlen"):
                 frozen_reference=True,
                 resumed_optimizer_update=True,
                 reference_state_sidecars=len(state_files),
+                ema_updates=trainer.ema_updates if mode == "flow_cpo" else None,
+                ema_accumulation_checked=mode == "flow_cpo",
             )
         )
     )
@@ -194,7 +300,7 @@ class PostTrainingIntegrationTests(unittest.TestCase):
         self._training_loops("dense")
 
     def _training_loops(self, encoding):
-        for mode in ("rft", "flow_dpo"):
+        for mode in ("rft", "flow_dpo", "flow_cpo"):
             with self.subTest(mode=mode, encoding=encoding), tempfile.TemporaryDirectory() as directory:
                 environment = dict(
                     os.environ,
@@ -221,6 +327,9 @@ class PostTrainingIntegrationTests(unittest.TestCase):
                 self.assertEqual(records[0]["conditioning"], encoding)
                 self.assertEqual(records[0]["steps"], 2)
                 self.assertGreater(records[0]["updated_up_tensors"], 0)
+                if mode == "flow_cpo":
+                    self.assertEqual(records[0]["ema_updates"], 3)
+                    self.assertTrue(records[0]["ema_accumulation_checked"])
 
 
 if __name__ == "__main__":

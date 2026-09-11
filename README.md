@@ -14,11 +14,61 @@ Krea2 Trainer 是從 [`kohya-ss/musubi-tuner`](https://github.com/kohya-ss/musub
 
 ---
 
-## 離線偏好後訓練：RFT / FlowDPO
+## 快速導覽
 
-既有 CLI 現在支援 `--post_training rft` 與 `--post_training flow_dpo`。兩者共用原始圖片 basename 的偏好 JSONL 與現有 latent／text cache；可用 `--reference_lora` 凍結第一階段成果，再訓練獨立增量 LoRA。
+- **初次使用**：[安裝](#安裝) → [模型檔](#需要準備的模型檔) → [資料集設定](#資料集設定) → [標準訓練流程](#標準訓練流程)。
+- **第一階段品質分流**：[TQD 配置與範例](#timestep-aware-quality-decoupling-tqd選用)。
+- **既有 LoRA 的第二階段訓練**：先讀下方模式說明，再看 [RFT／FlowDPO 指南](docs/post-training.md) 或 [FlowCPO 指南](docs/flow-cpo.md)。
+- **環境與追蹤**：[W&B logging](#wb-logging)、[容器訓練](#容器訓練)、[疑難排解](#疑難排解)。
+- **驗證範圍**：[RFT／FlowDPO 驗證](docs/post-training-verification.md)、[FlowCPO 驗證](docs/flow-cpo-verification.md)。
 
-完整資料格式、reference／輸出語意、命令、限制與原論文來源見 **[後訓練指南](docs/post-training.md)**。這是可測試的訓練實作，不代表已完成真實資料的畫質驗證。
+## 訓練模式
+
+所有模式共用 `krea2-train-lora`，不需要另外安裝 FlowCPO package。
+
+- **標準 LoRA／TQD**：不指定 `--post_training`。先學習概念、風格或人物；TQD 是可選的資料品質／timestep 路由。
+- **RFT**：`--post_training rft`。只對 chosen 圖片做 flow-matching 訓練，依 `(chosen, prompt)` 去重。
+- **FlowDPO**：`--post_training flow_dpo`。使用 chosen/rejected 配對，對照固定的底模＋第一階段 LoRA，學習偏好差異。
+- **FlowCPO**：`--post_training flow_cpo`。使用相同配對，以第二階段 LoRA 的 FP32 EMA 作 old policy，進行正向／鏡像 velocity 回歸。
+
+### 第二階段共同契約
+
+1. 先完成 latent／text cache，並建立原始圖片 basename 的偏好 JSONL；詳細格式見 [資料契約](docs/post-training.md)。DPO／CPO 每一對須有相同 prompt、conditioning、latent shape 與 bucket；只設定 `resolution = [1024, 1024]` 不會把既有 cache 強制改成正方形。
+2. 用 `--reference_lora` 指定要保留的第一階段 LoRA。第二階段新增獨立增量 adapter，不覆蓋或訓練第一階段。
+3. 明確指定 `--mixed_precision bf16` 或 `fp16`；DPO／CPO 使用 `--timestep_sampling uniform --weighting_scheme none`。不要套用 `--preset` 或 TQD 配方。
+4. 使用不同的 `--output_dir`／`--output_name` 區隔實驗。輸出只有第二階段增量 LoRA，推論仍需同一底模＋第一階段 LoRA。
+5. 要續訓就加 `--save_state`，並用 `--resume` 指向同一方法的相容 state 目錄；不能把 DPO state 當 CPO state 載入，也不能用 `--network_weights` 代替完整續訓。
+
+### FlowCPO 啟動範本
+
+以下使用由你替換的路徑；本機已核對的命令見 [FlowCPO 指南](docs/flow-cpo.md#從原訓練目錄執行)。先沿用已驗證的第一階段，不預設 CPO 一定比 DPO 更快或畫質更好。
+
+```bash
+krea2-train-lora \
+  --post_training flow_cpo \
+  --dataset_config /path/to/dataset.toml \
+  --preference_manifest /path/to/pairs.jsonl \
+  --preference_batch_size 1 \
+  --dit /path/to/krea2_raw_bf16.safetensors \
+  --reference_lora /path/to/stage1.safetensors \
+  --network_module krea2_trainer.networks.lora_krea2 \
+  --network_dim 32 --network_alpha 16 \
+  --flow_cpo_beta 0.5 --flow_cpo_lambda 1 --flow_cpo_ema_decay 0.99 \
+  --timestep_sampling uniform --weighting_scheme none \
+  --mixed_precision bf16 --sdpa --gradient_checkpointing \
+  --optimizer_type AdamW --optimizer_args weight_decay=0.01 \
+  --learning_rate 1e-5 --max_train_steps 500 --seed 17415 \
+  --save_state --save_every_n_steps 100 \
+  --output_dir /path/to/output/flow_cpo --output_name stage2_flow_cpo
+```
+
+- **CPO beta 不是 DPO beta**：不要保留 `--flow_dpo_beta 100`；上面的 `0.5 / 1 / 0.99` 是試驗起點，不是已驗證最佳值。
+- **Optimizer 限制**：CPO 目前只允許 AdamW、Adam、SGD、AdamW8bit 及列出的 `torch.optim` 等價名稱。CPU 整合測試使用 AdamW；AdamW8bit GPU 未驗證。**不要沿用 `Adopt_adv` 或其專屬 optimizer args。**
+- **記憶體與效能**：保留 gradient checkpointing；不支援 compile、block swap、checkpoint CPU offload、full reduced-precision policy 或非零 `scale_weight_norms`。
+- **保存與續訓**：CPO state 額外包含 `krea2_flow_cpo_ema.safetensors` 與 `krea2_post_training_state.json`。只載入 native LoRA 不會恢復 optimizer／EMA；EMA sidecar 也不是一般推論 LoRA。
+- **W&B**：需要追蹤時加 `--log_with wandb --log_config --log_tracker_name krea2-trainer --wandb_run_name stage2_flow_cpo`；只指定 run name 不等於啟用 tracker。
+
+下方標準訓練的 preset、TE refresh、Turbo sampling 與 Advanced Optimizers 範例，**不代表可直接套用到離線後訓練**。完整限制以各方法指南與 CLI validation 為準。
 
 ## 專案狀態
 
@@ -60,7 +110,12 @@ krea2-trainer/
       qwen_image_model.py
       qwen_image_modules.py
 
+    krea2_post_training.py
+    krea2_flow_cpo.py
+
     training/
+      preference.py
+      flow_cpo.py
       trainer_base.py
       parser_common.py
       accelerator_setup.py
@@ -68,6 +123,7 @@ krea2-trainer/
       timesteps.py
 
     dataset/
+      preference_dataset.py
       architectures.py
       bucket.py
       cache_io.py
@@ -744,7 +800,7 @@ Krea2 預設 LoRA target 是 DiT 裡所有 `Linear` layers。
 
 ## Advanced Optimizers 支援
 
-本專案支援 [`adv_optm`](https://pypi.org/project/adv-optm/) 提供的 Advanced Optimizers。
+本專案的標準訓練支援 [`adv_optm`](https://pypi.org/project/adv-optm/) 提供的 Advanced Optimizers。FlowCPO 不支援這些 `_adv` aliases；請使用其指南列出的 optimizer。
 
 可用 optimizer aliases：
 

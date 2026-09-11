@@ -492,6 +492,41 @@ class FlowDPOTrainingTests(unittest.TestCase):
             fixture.item(name, value, varlen=False)
         return fixture.build([fixture.record(), fixture.record("winner2", "loser2", "pair-2")])[0]
 
+    def test_reference_skips_only_policy_projections_and_checkpoint_backward_restores_them(self):
+        args, model, trainer, network = self.build(True)
+        policy_module = network.unet_loras[0]
+        reference_module = trainer.reference_network.unet_loras[0]
+        with torch.no_grad():
+            policy_module.lora_up.weight.fill_(0.07)
+        probe = torch.randn(1, 3, 2)
+        with reference_adapter_context(network, model):
+            expected = policy_module.org_forward(probe)
+            with patch.object(policy_module.lora_down, "forward", wraps=policy_module.lora_down.forward) as down:
+                torch.testing.assert_close(model.first(probe), expected, rtol=0, atol=0)
+            self.assertEqual(down.call_count, 0)
+        policy_phases, reference_phases = [], []
+        hooks = [
+            policy_module.lora_down.register_forward_pre_hook(
+                lambda *_: policy_phases.append(torch.is_grad_enabled())
+            ),
+            reference_module.lora_down.register_forward_pre_hook(
+                lambda *_: reference_phases.append(torch.is_grad_enabled())
+            ),
+        ]
+        try:
+            loss, _ = self.run_batch(args, model, trainer, network)
+            self.assertEqual(policy_phases, [True])
+            self.assertEqual(reference_phases, [False, True])
+            loss.backward()
+            self.assertGreater(len(policy_phases), 1)
+            self.assertTrue(all(policy_phases))
+            self.assertTrue(all(p.grad is not None for p in network.parameters()))
+            self.assertTrue(all(p.grad is None for p in trainer.reference_network.parameters()))
+            self.assertEqual(policy_module.multiplier, 1.0)
+        finally:
+            for hook in hooks:
+                hook.remove()
+
     def test_dense_dataset_conditioning_reaches_loss_and_backward(self):
         batch = self.dense_dataset_batch()
         embeds = batch["krea2_vl_embed"]

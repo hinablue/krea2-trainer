@@ -23,6 +23,9 @@ POST_DEFAULTS = {
     "preference_manifest": None,
     "preference_batch_size": 1,
     "flow_dpo_beta": 100.0,
+    "flow_cpo_beta": 0.5,
+    "flow_cpo_lambda": 1.0,
+    "flow_cpo_ema_decay": 0.99,
     "reference_lora": None,
 }
 
@@ -51,9 +54,23 @@ def _positive_float(value):
     return result
 
 
+def _nonnegative_float(value):
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise argparse.ArgumentTypeError("must be finite and nonnegative")
+    return result
+
+
+def _ema_decay(value):
+    result = _nonnegative_float(value)
+    if result >= 1:
+        raise argparse.ArgumentTypeError("must be in [0, 1)")
+    return result
+
+
 def add_post_training_arguments(parser):
     group = parser.add_argument_group("Krea2 preference post-training")
-    group.add_argument("--post_training", choices=("none", "rft", "flow_dpo"), default="none")
+    group.add_argument("--post_training", choices=("none", "rft", "flow_dpo", "flow_cpo"), default="none")
     group.add_argument(
         "--preference_manifest",
         action=_PostTrainingOption,
@@ -64,7 +81,7 @@ def add_post_training_arguments(parser):
         type=_positive_int,
         default=1,
         action=_PostTrainingOption,
-        help="Winners (RFT) or pairs (FlowDPO) per device microbatch; default 1.",
+        help="Winners (RFT) or pairs (FlowDPO/FlowCPO) per device microbatch; default 1.",
     )
     group.add_argument(
         "--flow_dpo_beta",
@@ -73,6 +90,27 @@ def add_post_training_arguments(parser):
         action=_PostTrainingOption,
         help="FlowDPO beta, default 100: logit = beta/2 * (rejected_delta - chosen_delta), "
         "using FP32 per-image mean velocity MSE, not a sum; no timestep/SNR weights.",
+    )
+    group.add_argument(
+        "--flow_cpo_beta",
+        type=_positive_float,
+        default=0.5,
+        action=_PostTrainingOption,
+        help="FlowCPO velocity interpolation/extrapolation beta; finite > 0, default 0.5.",
+    )
+    group.add_argument(
+        "--flow_cpo_lambda",
+        type=_nonnegative_float,
+        default=1.0,
+        action=_PostTrainingOption,
+        help="FlowCPO rejected-branch MSE coefficient; finite >= 0, default 1.",
+    )
+    group.add_argument(
+        "--flow_cpo_ema_decay",
+        type=_ema_decay,
+        default=0.99,
+        action=_PostTrainingOption,
+        help="FlowCPO FP32 incremental-adapter EMA decay in [0, 1), default 0.99.",
     )
     group.add_argument(
         "--reference_lora",
@@ -105,14 +143,16 @@ def validate_post_training_args(args):
     otherwise ignored post-training-only option was explicitly supplied.
     """
     mode = getattr(args, "post_training", "none")
-    if mode not in ("none", "rft", "flow_dpo"):
-        raise ValueError("--post_training must be none, rft or flow_dpo")
+    method = "FlowCPO" if mode == "flow_cpo" else "FlowDPO"
+    if mode not in ("none", "rft", "flow_dpo", "flow_cpo"):
+        raise ValueError("--post_training must be none, rft, flow_dpo or flow_cpo")
     explicit = _explicit_options(args)
     if mode == "none":
         supplied = [key for key, default in POST_DEFAULTS.items() if key in explicit or getattr(args, key, default) != default]
         if supplied:
             raise ValueError(
-                "Post-training-only options require --post_training rft or flow_dpo: " + ", ".join("--" + key for key in supplied)
+                "Post-training-only options require --post_training rft, flow_dpo or flow_cpo: "
+                + ", ".join("--" + key for key in supplied)
             )
         return
     if getattr(args, "mixed_precision", None) not in ("bf16", "fp16"):
@@ -123,7 +163,7 @@ def validate_post_training_args(args):
     if getattr(args, "preset", None):
         raise ValueError(
             "--preset is not supported for post-training: it overwrites explicit sampler/training options. "
-            "Pass the desired settings explicitly (FlowDPO requires --timestep_sampling uniform)."
+            "Pass the desired settings explicitly (FlowDPO/FlowCPO require --timestep_sampling uniform)."
         )
     if not getattr(args, "preference_manifest", None):
         raise ValueError("--preference_manifest is required for post-training")
@@ -133,8 +173,39 @@ def validate_post_training_args(args):
     beta = getattr(args, "flow_dpo_beta", 100.0)
     if isinstance(beta, bool) or not isinstance(beta, (int, float)) or not math.isfinite(beta) or beta <= 0:
         raise ValueError("--flow_dpo_beta must be finite and positive")
-    if mode == "rft" and ("flow_dpo_beta" in explicit or beta != 100.0):
+    if mode != "flow_dpo" and ("flow_dpo_beta" in explicit or beta != 100.0):
         raise ValueError("--flow_dpo_beta is only meaningful with --post_training flow_dpo")
+    for key in ("flow_cpo_beta", "flow_cpo_lambda", "flow_cpo_ema_decay"):
+        value = getattr(args, key, POST_DEFAULTS[key])
+        if mode != "flow_cpo":
+            if key in explicit or value != POST_DEFAULTS[key]:
+                raise ValueError(f"--{key} is only meaningful with --post_training flow_cpo")
+        elif (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+            or (key == "flow_cpo_beta" and value == 0)
+            or (key == "flow_cpo_ema_decay" and value >= 1)
+        ):
+            raise ValueError(f"--{key} must be finite and in its supported range")
+    if mode == "flow_cpo":
+        # The hook precedes post-step max-norm mutation, and schedule-free train/eval
+        # swaps can save a different policy than the one just used for EMA. Fail closed.
+        if str(getattr(args, "optimizer_type", "AdamW")).lower() not in (
+            "",
+            "adamw",
+            "adam",
+            "sgd",
+            "adamw8bit",
+            "torch.optim.adamw",
+            "torch.optim.adam",
+            "torch.optim.sgd",
+        ):
+            raise ValueError("FlowCPO supports only AdamW, Adam, SGD or AdamW8bit; optimizer mode-swapping paths are unverified")
+        for key in ("scale_weight_norms", "full_fp16", "full_bf16"):
+            if getattr(args, key, None):
+                raise ValueError(f"FlowCPO does not support --{key}: EMA requires the final FP32 policy matrices")
     if getattr(args, "network_module", None) not in (
         "krea2_trainer.networks.lora_krea2",
         "networks.lora_krea2",
@@ -176,25 +247,25 @@ def validate_post_training_args(args):
             raise ValueError("--base_weights_multiplier must be finite")
     # External reference adapters are not registered on the base transformer's
     # module tree; existing block-swap cannot place/stream this second stack.
-    if mode == "flow_dpo" or getattr(args, "reference_lora", None):
+    if mode in ("flow_dpo", "flow_cpo") or getattr(args, "reference_lora", None):
         if (
             str(getattr(args, "dynamo_backend", "NO")).upper() != "NO"
             or os.environ.get("ACCELERATE_DYNAMO_BACKEND", "NO").upper() != "NO"
         ):
-            raise ValueError("FlowDPO/stacked references require --dynamo_backend NO and no Accelerator Dynamo compilation")
+            raise ValueError(f"{method}/stacked references require --dynamo_backend NO and no Accelerator Dynamo compilation")
         for key in ("compile", "blocks_to_swap", "block_swap_h2d_only", "gradient_checkpointing_cpu_offload"):
             if getattr(args, key, None):
-                raise ValueError(f"--{key} is not yet supported with FlowDPO or a stacked --reference_lora")
-    if mode == "flow_dpo":
+                raise ValueError(f"--{key} is not yet supported with {method} or a stacked --reference_lora")
+    if mode in ("flow_dpo", "flow_cpo"):
         if getattr(args, "timestep_sampling", None) != "uniform":
-            raise ValueError("FlowDPO requires explicit --timestep_sampling uniform; no automatic schedule override")
+            raise ValueError(f"{method} requires explicit --timestep_sampling uniform; no automatic schedule override")
         if getattr(args, "weighting_scheme", None) != "none":
-            raise ValueError("FlowDPO requires --weighting_scheme none (no timestep/SNR weighting)")
+            raise ValueError(f"{method} requires --weighting_scheme none (no timestep/SNR weighting)")
         for key in ("min_timestep", "max_timestep", "num_timestep_buckets"):
             if getattr(args, key, None) is not None:
-                raise ValueError(f"FlowDPO does not support --{key}; uniform t must cover [0, 1)")
+                raise ValueError(f"{method} does not support --{key}; uniform t must cover [0, 1)")
         if getattr(args, "preserve_distribution_shape", False):
-            raise ValueError("FlowDPO does not support --preserve_distribution_shape")
+            raise ValueError(f"{method} does not support --preserve_distribution_shape")
         # Reject altered controls which the uniform objective does not consume.
         for key, default in (
             ("discrete_flow_shift", 1.0),
@@ -204,15 +275,15 @@ def validate_post_training_args(args):
             ("mode_scale", 1.29),
         ):
             if getattr(args, key, default) != default:
-                raise ValueError(f"FlowDPO uniform sampling does not use --{key}")
+                raise ValueError(f"{method} uniform sampling does not use --{key}")
         if getattr(args, "network_dropout", None) not in (None, 0, 0.0):
-            raise ValueError("FlowDPO requires deterministic adapters: --network_dropout must be zero")
+            raise ValueError(f"{method} requires deterministic adapters: --network_dropout must be zero")
         for item in getattr(args, "network_args", None) or ():
             key, separator, value = item.partition("=")
             if not separator:
                 raise ValueError("--network_args must be key=value")
             if key in ("rank_dropout", "module_dropout", "neuron_dropout") and float(value) != 0:
-                raise ValueError(f"FlowDPO requires zero {key}")
+                raise ValueError(f"{method} requires zero {key}")
 
 
 def per_image_mse(prediction, target):
@@ -317,7 +388,7 @@ def build_reference_contract(args):
     """Record the immutable reference, not the current/resumed policy weights."""
     base_weights = getattr(args, "base_weights", None) or []
     multipliers = getattr(args, "base_weights_multiplier", None) or []
-    return {
+    contract = {
         "version": 1,
         "adapter_semantics": "incremental-on-identical-dit-plus-stage1",
         "post_training": args.post_training,
@@ -362,6 +433,19 @@ def build_reference_contract(args):
             )
         },
     }
+
+    if args.post_training == "flow_cpo":
+        # Do not change even the key set of the existing RFT/DPO version-1 contract.
+        contract.pop("flow_dpo_beta")
+        contract.update(
+            objective="mean-fp32-mixed-velocity-mse-uniform-ema-lora",
+            flow_cpo_beta=args.flow_cpo_beta,
+            flow_cpo_lambda=args.flow_cpo_lambda,
+            flow_cpo_ema_decay=args.flow_cpo_ema_decay,
+            ema_semantics="fp32-second-stage-lora-matrices-after-successful-optimizer-update",
+        )
+        contract["settings"]["optimizer_type"] = args.optimizer_type or "AdamW"
+    return contract
 
 
 def validate_resume_contract(directory, expected):

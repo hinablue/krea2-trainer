@@ -4,6 +4,7 @@ models/
 output/
 configs/
 datasets/
+wandb
 .cache
 
 # Python environments and build artifacts.

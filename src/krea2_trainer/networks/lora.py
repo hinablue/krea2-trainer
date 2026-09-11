@@ -138,6 +138,18 @@ class LoRAModule(torch.nn.Module):
     def forward(self, x):
         org_forwarded = self.org_forward(x)
 
+        # Reference inference disables only this adapter. Keep org_forward above
+        # so the base and any stacked stage-one adapter still run. Restrict the
+        # shortcut to eval/no-grad: training must retain zero gradients and its
+        # dropout RNG behavior. Scalar-only avoids tensor sync/gradient changes.
+        if (
+            not self.training
+            and not torch.is_grad_enabled()
+            and isinstance(self.multiplier, (int, float))
+            and self.multiplier == 0
+        ):
+            return org_forwarded
+
         # module dropout
         if self.module_dropout is not None and self.training:
             if torch.rand(1) < self.module_dropout:

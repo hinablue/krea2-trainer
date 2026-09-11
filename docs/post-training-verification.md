@@ -40,6 +40,16 @@ OK
 - 嚴格驗證所有 `base_weights`／`reference_lora` 目標、triplets、形狀與有限數值，避免沒有匹配到 LoRA 卻靜默訓練裸底模。
 - FlowDPO 同時接收 dense tensor 與 varlen list conditioning，並測試完整 dataset → forward／backward → save／resume 路徑。
 
+## 停用 adapter 的 reference 推論最佳化
+
+`LoRAModule.forward()` 在 eval、no-grad 且 Python scalar multiplier 為零時，直接回傳 `org_forward` 結果，跳過該 adapter 的 down/up 投影與輸入轉型。底模和已掛載的第一階段 LoRA 仍然執行；policy forward、checkpoint backward、loss 與訓練參數不變。保留 `--gradient_checkpointing`，本次不需要新增 CLI 參數。
+
+- 先以 projection call-count 回歸測試重現舊版仍有多餘計算，再加入修正。
+- 新增 Linear、split Linear、Conv2d、Conv3d 停用推論測試；保留 grad-enabled 零梯度及 train/no-grad dropout 路徑。
+- 實際 stacked FlowDPO 測試確認 reference 階段第二階段 projection 呼叫為零，第一階段仍執行，policy 與 checkpoint backward 恢復正常投影。
+- 全套：`Ran 121 tests in 11.836s`，`OK`。Ruff、`git diff --check` 與訓練 CLI help 通過。
+- 僅 CPU synthetic／縮小 DiT 驗證；未重新啟動正式訓練，未量測完整 GPU step 加速幅度。
+
 ## 未驗證與未執行
 
 - 沒有載入正式 Krea2 checkpoint 進行完整尺寸 GPU 訓練。

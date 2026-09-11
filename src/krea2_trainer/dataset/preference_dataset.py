@@ -334,7 +334,7 @@ class PreferenceDataset(BaseDataset):
         if self.shared_epoch is not None:
             self.set_current_epoch(int(self.shared_epoch.value))
         batch = self.batch_manager[idx]
-        if self.mode == "flow_dpo":
+        if self.mode in ("flow_dpo", "flow_cpo"):
             bucket, batch_index = self.batch_manager.bucket_batch_indices[idx]
             start = batch_index * self.batch_size
             chosen_items = self.batch_manager.buckets[bucket][start : start + self.batch_size]
@@ -353,8 +353,8 @@ def build_preference_dataset_group(
     In RFT neither rejected item lookup nor rejected cache reads are required.
     Validation retains at most a chosen/rejected pair of tensors at a time.
     """
-    if mode not in ("rft", "flow_dpo"):
-        raise ValueError("Preference mode must be rft or flow_dpo")
+    if mode not in ("rft", "flow_dpo", "flow_cpo"):
+        raise ValueError("Preference mode must be rft, flow_dpo or flow_cpo")
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size <= 0:
         raise ValueError("Preference batch_size must be a positive integer")
     if isinstance(seed, bool) or not isinstance(seed, int):
@@ -375,7 +375,7 @@ def build_preference_dataset_group(
         chosen = index[pair.chosen]
         chosen_batch, schema = _validate_and_load(chosen, pair.prompt)
         rejected = None
-        if mode == "flow_dpo":
+        if mode in ("flow_dpo", "flow_cpo"):
             if pair.rejected not in index:
                 raise ValueError(f"Missing rejected cache item for pair {pair.pair_id}: {pair.rejected}")
             rejected = index[pair.rejected]
@@ -393,7 +393,7 @@ def build_preference_dataset_group(
         "Prepared %s preference dataset: %d %s in %d batches",
         mode,
         dataset.num_train_items,
-        "pairs" if mode == "flow_dpo" else "samples",
+        "pairs" if mode in ("flow_dpo", "flow_cpo") else "samples",
         len(dataset),
     )
     return DatasetGroup([dataset])
