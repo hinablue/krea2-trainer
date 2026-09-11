@@ -37,6 +37,7 @@ NUM_CPU_THREADS_PER_PROCESS="${NUM_CPU_THREADS_PER_PROCESS:-1}"
 MAX_DATA_LOADER_N_WORKERS="${MAX_DATA_LOADER_N_WORKERS:-4}"
 SEED="${SEED:-17415}"
 ENABLE_COMPILE="${ENABLE_COMPILE:-0}"
+ENABLE_FP8="${ENABLE_FP8:-0}"
 COMPILE_MODE="${COMPILE_MODE:-max-autotune-no-cudagraphs}"
 COMPILE_DYNAMIC="${COMPILE_DYNAMIC:-auto}"
 COMPILE_CACHE_SIZE_LIMIT="${COMPILE_CACHE_SIZE_LIMIT:-32}"
@@ -89,7 +90,7 @@ TRAIN_ARGS=(
   --raw_dit "${RAW_DIT}" --vae "${VAE}" --dataset_config "${DATASET_CONFIG}"
   --sdpa --mixed_precision bf16 --save_precision bf16 --weighting_scheme none
   --gradient_checkpointing --network_module krea2_trainer.networks.lora_krea2
-  --network_dim 32 --network_alpha 16 --disable_numpy_memmap --fp8_base --fp8_scaled
+  --network_dim 32 --network_alpha 16 --disable_numpy_memmap
   --learning_rate 5e-5 --lr_scheduler constant_with_warmup
   --optimizer_type Adopt_adv --optimizer_args cautious_wd=true kourkoutas_beta=true use_atan2=true weight_decay=0.01
   --max_train_epochs "${MAX_TRAIN_EPOCHS}" --save_every_n_epochs "${SAVE_EVERY_N_EPOCHS}"
@@ -119,6 +120,10 @@ fi
 
 if [[ -n "${MAX_TRAIN_STEPS:-}" ]]; then
   TRAIN_ARGS+=(--max_train_steps "${MAX_TRAIN_STEPS}")
+fi
+
+if [[ "${ENABLE_FP8}" == 1 ]]; then
+  TRAIN_ARGS+=(--fp8_base --fp8_scaled)
 fi
 
 if [[ "${REFRESH_TEXT_CACHE_EVERY_EPOCH:-0}" == "1" ]]; then

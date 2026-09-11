@@ -520,6 +520,7 @@ dependencies = [
     { name = "tqdm" },
     { name = "transformers" },
     { name = "voluptuous" },
+    { name = "wandb" },
 ]
 
 [package.optional-dependencies]
@@ -566,6 +567,7 @@ requires-dist = [
     { name = "tqdm", specifier = "==4.67.1" },
     { name = "transformers", specifier = "==4.57.6" },
     { name = "voluptuous", specifier = "==0.15.2" },
+    { name = "wandb", specifier = ">=0.17.0" },
     { name = "wandb", marker = "extra == 'tracking'", specifier = ">=0.17.0" },
 ]
 provides-extras = ["cu124", "cu128", "cu130", "tracking", "dev"]

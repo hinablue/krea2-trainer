@@ -29,6 +29,7 @@ from krea2_trainer.training.trainer_base import DiTOutput, NetworkTrainer
 from krea2_trainer.training.accelerator_setup import clean_memory_on_device
 from krea2_trainer.training.sampling_prompts import load_prompts
 from krea2_trainer.training.parser_common import setup_parser_common, read_config_from_file
+from krea2_trainer.training.preference import add_post_training_arguments, validate_post_training_args
 from krea2_trainer import cache_text_encoder_outputs
 from krea2_trainer.krea2 import krea2_utils
 from krea2_trainer.krea2 import krea2_sampling
@@ -633,6 +634,7 @@ class Krea2NetworkTrainer(NetworkTrainer):
 
 
 def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    add_post_training_arguments(parser)
     parser.add_argument(
         "--preset",
         choices=["lora-default"],
@@ -751,6 +753,8 @@ def krea2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
 
 def apply_krea2_preset(args: argparse.Namespace) -> argparse.Namespace:
     """Expand standalone Krea2 presets after CLI/config parsing."""
+    if getattr(args, "post_training", "none") != "none" and args.preset is not None:
+        raise ValueError("--preset overwrites explicit training options; post-training requires explicit settings instead")
     if args.preset != "lora-default":
         return args
 
@@ -776,13 +780,19 @@ def main():
 
     args = parser.parse_args()
     args = read_config_from_file(args, parser)
+    validate_post_training_args(args)
     args = apply_krea2_preset(args)
 
     args.dit_dtype = "bfloat16"
     if args.vae_dtype is None:
         args.vae_dtype = "bfloat16"
 
-    trainer = Krea2NetworkTrainer()
+    if args.post_training == "none":
+        trainer = Krea2NetworkTrainer()
+    else:
+        from krea2_trainer.krea2_post_training import Krea2PostTrainingTrainer
+
+        trainer = Krea2PostTrainingTrainer()
     trainer.train(args)
 
 

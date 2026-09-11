@@ -14,6 +14,12 @@ Krea2 Trainer 是從 [`kohya-ss/musubi-tuner`](https://github.com/kohya-ss/musub
 
 ---
 
+## 離線偏好後訓練：RFT / FlowDPO
+
+既有 CLI 現在支援 `--post_training rft` 與 `--post_training flow_dpo`。兩者共用原始圖片 basename 的偏好 JSONL 與現有 latent／text cache；可用 `--reference_lora` 凍結第一階段成果，再訓練獨立增量 LoRA。
+
+完整資料格式、reference／輸出語意、命令、限制與原論文來源見 **[後訓練指南](docs/post-training.md)**。這是可測試的訓練實作，不代表已完成真實資料的畫質驗證。
+
 ## 專案狀態
 
 目前版本：`0.2.0`
