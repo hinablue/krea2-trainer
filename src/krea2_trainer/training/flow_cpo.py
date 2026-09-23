@@ -18,6 +18,8 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 import torch
 
+from krea2_trainer.training.metrics import materialize_metrics
+
 from krea2_trainer.utils.tensor_checks import all_finite
 
 
@@ -43,7 +45,10 @@ def _finite_scalar(value, name, *, minimum, maximum=None, inclusive_minimum=True
     return result
 
 
-def flow_cpo_loss(policy_chosen, policy_rejected, old_chosen, old_rejected, target_chosen, target_rejected, beta, loss_lambda):
+def flow_cpo_loss(
+    policy_chosen, policy_rejected, old_chosen, old_rejected, target_chosen, target_rejected, beta, loss_lambda,
+    *, collect_metrics=True, metrics_as_tensors=False,
+):
     """Return ``(loss, metrics)`` from six native velocity tensors [pairs, ...].
 
     All six shapes must be identical, nonempty and at least two-dimensional.
@@ -80,12 +85,14 @@ def flow_cpo_loss(policy_chosen, policy_rejected, old_chosen, old_rejected, targ
     chosen_mean, rejected_mean = chosen.detach().mean(), rejected.detach().mean()
     if not all_finite((chosen, rejected, loss, chosen_mean, rejected_mean)):
         raise FloatingPointError("Non-finite FP32 FlowCPO objective or branch MSE")
-    loss_value, chosen_value, rejected_value = torch.stack((loss.detach(), chosen_mean, rejected_mean)).cpu().tolist()
-    return loss, {
-        "flow_cpo/loss": loss_value,
-        "flow_cpo/chosen_mse": chosen_value,
-        "flow_cpo/rejected_mse": rejected_value,
+    if not collect_metrics:
+        return loss, {}
+    metrics = {
+        "flow_cpo/loss": loss.detach(),
+        "flow_cpo/chosen_mse": chosen_mean,
+        "flow_cpo/rejected_mse": rejected_mean,
     }
+    return loss, metrics if metrics_as_tensors else materialize_metrics(metrics)
 
 
 def _native_modules(network):

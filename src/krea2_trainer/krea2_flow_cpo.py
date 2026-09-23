@@ -10,6 +10,8 @@ import logging
 
 import torch
 
+from krea2_trainer.training.metrics import materialize_metrics
+
 from krea2_trainer.krea2_post_training import Krea2PostTrainingTrainer
 from krea2_trainer.networks import lora_krea2
 from krea2_trainer.training.flow_cpo import AdapterEMA, flow_cpo_loss, old_adapter_context
@@ -203,11 +205,14 @@ class Krea2FlowCPOTrainer(Krea2PostTrainingTrainer):
             args, accelerator, batch, latents, noise, dit_dtype, network_dtype
         )
         pair_batch["_krea2_pair_count"] = pairs
-        with old_adapter_context(policy_network, self.ema_network, accelerator.unwrap_model(transformer)):
+        with self.profile_phase("old_forward"), old_adapter_context(
+            policy_network, self.ema_network, accelerator.unwrap_model(transformer)
+        ):
             old = self.call_dit(args, accelerator, transformer, combined, pair_batch, paired_noise, noisy, timesteps, network_dtype)
         # No adapter state mutation follows this forward until checkpointed
         # backward completes and a genuine optimizer update has occurred.
-        policy = self.call_dit(args, accelerator, transformer, combined, pair_batch, paired_noise, noisy, timesteps, network_dtype)
+        with self.profile_phase("policy_forward"):
+            policy = self.call_dit(args, accelerator, transformer, combined, pair_batch, paired_noise, noisy, timesteps, network_dtype)
         loss, metrics = flow_cpo_loss(
             policy.pred[:pairs],
             policy.pred[pairs:],
@@ -217,7 +222,11 @@ class Krea2FlowCPOTrainer(Krea2PostTrainingTrainer):
             policy.target[pairs:],
             args.flow_cpo_beta,
             args.flow_cpo_lambda,
+            collect_metrics=bool(getattr(accelerator, "trackers", ())),
+            metrics_as_tensors=True,
         )
-        metrics["flow_cpo/timestep_mean"] = t.mean().item()
-        metrics["flow_cpo/ema_updates"] = self.ema_updates
+        if metrics:
+            metrics["flow_cpo/timestep_mean"] = t.detach().mean()
+            metrics = materialize_metrics(metrics)
+            metrics["flow_cpo/ema_updates"] = self.ema_updates
         return loss, metrics

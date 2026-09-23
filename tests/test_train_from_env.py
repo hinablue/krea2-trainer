@@ -41,6 +41,75 @@ class TrainingLauncherTests(unittest.TestCase):
         )
         return env, log
 
+    def test_step_caps_reach_real_trainer_resolution_without_epoch_override(self):
+        import shlex
+        from types import SimpleNamespace
+        import torch
+        from krea2_trainer.krea2_train_network import krea2_setup_parser
+        from krea2_trainer.training.parser_common import setup_parser_common
+        from krea2_trainer.training.trainer_base import NetworkTrainer
+
+        for env_steps, extra, expected in (("2", [], 2), (None, ["--max_train_steps", "3"], 3),
+                                            (None, ["--max_train_steps=4"], 4), (None, [], 50)):
+            with self.subTest(env_steps=env_steps, extra=extra), tempfile.TemporaryDirectory() as tmp:
+                env, log = self.base_env(Path(tmp))
+                env.pop("MAX_TRAIN_STEPS", None)
+                env.update(CACHE_MODE="none", MAX_TRAIN_EPOCHS="5")
+                if env_steps:
+                    env["MAX_TRAIN_STEPS"] = env_steps
+                subprocess.run(["bash", str(ROOT / "scripts/train_from_env.sh"), *extra], env=env, check=True,
+                               capture_output=True, text=True)
+                argv = shlex.split(log.read_text())
+                args = krea2_setup_parser(setup_parser_common()).parse_args(argv[argv.index("-m") + 2:])
+                args.max_data_loader_n_workers = 0
+                args.gradient_accumulation_steps = 1
+                if env_steps or extra:
+                    self.assertIsNone(args.max_train_epochs)
+                dataset = torch.utils.data.TensorDataset(torch.zeros(10, 1))
+                dataset.set_max_train_steps = lambda steps: None
+                param = torch.nn.Parameter(torch.zeros(1))
+                network = SimpleNamespace(prepare_optimizer_params=lambda **kw: ([param], None))
+                trainer = SimpleNamespace(
+                    extra_trainable_params=lambda args, accel, network, transformer, params: params,
+                    get_optimizer=lambda args, params: ("SGD", {}, torch.optim.SGD(params, lr=.001), lambda: None, lambda: None),
+                    get_lr_scheduler=lambda *args: None,
+                )
+                accelerator = SimpleNamespace(num_processes=1, print=lambda *args: None)
+                NetworkTrainer._build_optimizer_and_dataloader(trainer, args, accelerator, network, dataset, None, None)
+                self.assertEqual(args.max_train_steps, expected)
+
+    def test_conflicting_explicit_limits_fail_before_launch(self):
+        for extra in (["--max_train_steps", "2", "--max_train_epochs", "5"],
+                      ["--max_train_steps=2", "--max_train_epochs=5"]):
+            with tempfile.TemporaryDirectory() as tmp:
+                env, log = self.base_env(Path(tmp))
+                env.update(CACHE_MODE="none")
+                result = subprocess.run(["bash", str(ROOT / "scripts/train_from_env.sh"), *extra], env=env,
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("not both", result.stderr)
+                self.assertFalse(log.exists())
+
+    def test_abbreviated_limits_fail_before_cache_or_launch(self):
+        from krea2_trainer.krea2_train_network import krea2_setup_parser
+        from krea2_trainer.training.parser_common import setup_parser_common
+
+        # Direct Python CLI keeps its existing argparse abbreviation behavior.
+        parsed = krea2_setup_parser(setup_parser_common()).parse_args(["--max_train_step", "2"])
+        self.assertEqual(parsed.max_train_steps, 2)
+        cases = (["--max_train_step", "2"], ["--max_train_s=2"],
+                 ["--max_train_steps", "2", "--max_train_epoch", "5"], ["--max_train_e=5"])
+        for extra in cases:
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as tmp:
+                env, log = self.base_env(Path(tmp))
+                env.pop("MAX_TRAIN_STEPS", None)
+                env.update(CACHE_MODE="all", MAX_TRAIN_EPOCHS="5")
+                result = subprocess.run(["bash", str(ROOT / "scripts/train_from_env.sh"), *extra], env=env,
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("full option names", result.stderr)
+                self.assertFalse(log.exists())
+
     def test_all_cache_runs_in_fixed_order_then_training(self):
         with tempfile.TemporaryDirectory() as tmp:
             env, log = self.base_env(Path(tmp))

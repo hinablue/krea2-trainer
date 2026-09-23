@@ -13,6 +13,8 @@ from safetensors import SafetensorError
 from safetensors.torch import load_file
 import torch
 
+from krea2_trainer.training.metrics import materialize_metrics
+
 from krea2_trainer.dataset import config_utils
 from krea2_trainer.krea2_train_network import Krea2NetworkTrainer
 from krea2_trainer.networks import lora_krea2
@@ -325,9 +327,12 @@ class Krea2PostTrainingTrainer(Krea2NetworkTrainer):
         pairs, t, combined, pair_batch, paired_noise, noisy, timesteps = self._prepare_paired_batch(
             args, accelerator, batch, latents, noise, dit_dtype, network_dtype
         )
+        # Reuse raw inputs across branches, and conditioning within each pair.
+        # Learned intermediates are still recomputed for each adapter state.
+        pair_batch["_krea2_pair_count"] = pairs
         policy_network = accelerator.unwrap_model(network)
         base_model = accelerator.unwrap_model(transformer)
-        with reference_adapter_context(policy_network, base_model):
+        with self.profile_phase("reference_forward"), reference_adapter_context(policy_network, base_model):
             reference = self.call_dit(
                 args,
                 accelerator,
@@ -342,17 +347,18 @@ class Krea2PostTrainingTrainer(Krea2NetworkTrainer):
             reference_mse = per_image_mse(reference.pred, reference.target)
         # Reference forward finishes and multiplier/train flags are restored
         # BEFORE this graph exists. Checkpoint recomputation sees policy forever.
-        policy = self.call_dit(
-            args,
-            accelerator,
-            transformer,
-            combined,
-            pair_batch,
-            paired_noise,
-            noisy,
-            timesteps,
-            network_dtype,
-        )
+        with self.profile_phase("policy_forward"):
+            policy = self.call_dit(
+                args,
+                accelerator,
+                transformer,
+                combined,
+                pair_batch,
+                paired_noise,
+                noisy,
+                timesteps,
+                network_dtype,
+            )
         policy_mse = per_image_mse(policy.pred, policy.target)
         loss, metrics = flow_dpo_loss(
             policy_mse[:pairs],
@@ -360,6 +366,10 @@ class Krea2PostTrainingTrainer(Krea2NetworkTrainer):
             reference_mse[:pairs],
             reference_mse[pairs:],
             args.flow_dpo_beta,
+            collect_metrics=bool(getattr(accelerator, "trackers", ())),
+            metrics_as_tensors=True,
         )
-        metrics["flow_dpo/timestep_mean"] = t.mean().item()
+        if metrics:
+            metrics["flow_dpo/timestep_mean"] = t.detach().mean()
+            metrics = materialize_metrics(metrics)
         return loss, metrics

@@ -8,6 +8,7 @@ wan_train_network.py, ...).
 """
 
 import ast
+from contextlib import nullcontext
 import asyncio
 import importlib
 import argparse
@@ -58,6 +59,7 @@ from krea2_trainer.training.accelerator_setup import (
     prepare_accelerator,
 )
 from krea2_trainer.training.sampling_prompts import should_sample_images
+from krea2_trainer.training.profiling import create_step_profiler
 from krea2_trainer.training.timesteps import (
     compute_density_for_timestep_sampling,
     compute_ideogram4_shift_timestep,
@@ -185,6 +187,10 @@ class NetworkTrainer:
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4, except Qwen-Image-Layered
         self.default_discrete_flow_shift = 14.5  # default value for discrete flow shift for all models TODO may be None is better
         self._tqd_score_cache = TQDScoreCache()
+        self._step_profiler = None
+
+    def profile_phase(self, name):
+        return self._step_profiler.phase(name) if self._step_profiler is not None else nullcontext()
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -2205,6 +2211,9 @@ class NetworkTrainer:
         clean_memory_on_device(accelerator.device)
 
         optimizer_train_fn()  # Set training mode
+        self._step_profiler = create_step_profiler(args, accelerator)
+        if self._step_profiler is not None:
+            logger.info("Opt-in synchronized microstep profile: %s", self._step_profiler.output)
         mark_cudagraph_step = model_utils.should_mark_cudagraph_step(args)
         if mark_cudagraph_step:
             logger.info("Using explicit CUDA Graph iteration boundaries for compiled DiT training.")
@@ -2226,7 +2235,11 @@ class NetworkTrainer:
 
             accelerator.unwrap_model(network).on_epoch_start(transformer)
 
-            for step, batch in enumerate(train_dataloader):
+            batches = self._step_profiler.iter_batches(train_dataloader) if self._step_profiler else train_dataloader
+            for step, batch in enumerate(batches):
+                if self._step_profiler is not None:
+                    self._step_profiler.begin_step(global_step, units=batch["latents"].shape[0])
+                auxiliary_work = False
                 if mark_cudagraph_step:
                     # Gradient checkpointing keeps forward outputs alive until
                     # backward. Mark the boundary before the compiled DiT runs
@@ -2238,44 +2251,51 @@ class NetworkTrainer:
                 with accelerator.accumulate(training_model):
                     accelerator.unwrap_model(network).on_step_start()
 
-                    latents = self.scale_shift_latents(latents)
+                    with self.profile_phase("input_preparation"):
+                        latents = self.scale_shift_latents(latents)
 
-                    # Sample noise that we'll add to the latents
-                    noise = torch.randn_like(latents)
+                        # Sample noise that we'll add to the latents
+                        noise = torch.randn_like(latents)
 
-                    loss, loss_metrics = self.process_batch(
-                        args,
-                        accelerator,
-                        transformer,
-                        network,
-                        batch,
-                        latents,
-                        noise,
-                        noise_scheduler,
-                        dit_dtype,
-                        network_dtype,
-                        vae,
-                        global_step,
-                    )
+                    with self.profile_phase("process_batch"):
+                        loss, loss_metrics = self.process_batch(
+                            args,
+                            accelerator,
+                            transformer,
+                            network,
+                            batch,
+                            latents,
+                            noise,
+                            noise_scheduler,
+                            dit_dtype,
+                            network_dtype,
+                            vae,
+                            global_step,
+                        )
 
-                    accelerator.backward(loss)
-                    if accelerator.sync_gradients:
-                        # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
-                        state = accelerate.PartialState()
-                        if state.distributed_type != accelerate.DistributedType.NO:
-                            for param in network.parameters():
-                                if param.grad is not None:
-                                    param.grad = accelerator.reduce(param.grad, reduction="mean")
+                    with self.profile_phase("backward"):
+                        accelerator.backward(loss)
+                    with self.profile_phase("gradient_sync_and_clip"):
+                        if accelerator.sync_gradients:
+                            # self.all_reduce_network(accelerator, network)  # sync DDP grad manually
+                            state = accelerate.PartialState()
+                            if state.distributed_type != accelerate.DistributedType.NO:
+                                for param in network.parameters():
+                                    if param.grad is not None:
+                                        param.grad = accelerator.reduce(param.grad, reduction="mean")
 
-                        if args.max_grad_norm != 0.0:
-                            params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
-                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                            if args.max_grad_norm != 0.0:
+                                params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
+                                accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
+                    with self.profile_phase("optimizer"):
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
 
-                    self.on_post_optimizer_step(args, accelerator, network, transformer, accelerator.sync_gradients, global_step)
+                    with self.profile_phase("post_optimizer_hook"):
+                        self.on_post_optimizer_step(args, accelerator, network, transformer, accelerator.sync_gradients, global_step)
+                    optimizer_updated = accelerator.sync_gradients and not accelerator.optimizer_step_was_skipped
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(
@@ -2297,6 +2317,7 @@ class NetworkTrainer:
                     should_saving = args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0
 
                     if should_sampling or should_saving:
+                        auxiliary_work = True
                         optimizer_eval_fn()
                         if should_sampling:
                             _do_sample(None, global_step)
@@ -2316,23 +2337,29 @@ class NetworkTrainer:
                                     remove_model(remove_ckpt_name)
                         optimizer_train_fn()
 
-                current_loss = loss.detach().item()
-                loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
-                avr_loss: float = loss_recorder.moving_average
-                logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
-                progress_bar.set_postfix(**logs)
+                with self.profile_phase("logging"):
+                    current_loss = loss.detach().item()
+                    loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
+                    avr_loss: float = loss_recorder.moving_average
+                    logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+                    progress_bar.set_postfix(**logs)
 
-                if args.scale_weight_norms:
-                    progress_bar.set_postfix(**{**max_mean_logs, **logs})
+                    if args.scale_weight_norms:
+                        progress_bar.set_postfix(**{**max_mean_logs, **logs})
 
-                if len(accelerator.trackers) > 0:
-                    logs = self.generate_step_logs(
-                        args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm
+                    if len(accelerator.trackers) > 0:
+                        logs = self.generate_step_logs(
+                            args, current_loss, avr_loss, lr_scheduler, lr_descriptions, optimizer, keys_scaled, mean_norm, maximum_norm
+                        )
+                        logs.update(loss_metrics)
+                        logs.update(self.extra_step_logs(args, logs))
+                        accelerator.log(logs, step=global_step)
+
+                if self._step_profiler is not None:
+                    self._step_profiler.end_step(
+                        optimizer_updated=optimizer_updated,
+                        auxiliary_work=auxiliary_work,
                     )
-                    logs.update(loss_metrics)
-                    logs.update(self.extra_step_logs(args, logs))
-                    accelerator.log(logs, step=global_step)
-
                 if global_step >= args.max_train_steps:
                     break
 
@@ -2365,6 +2392,9 @@ class NetworkTrainer:
             optimizer_train_fn()
 
             # end of epoch
+
+        if self._step_profiler is not None:
+            self._step_profiler.finish()
 
         # metadata["ss_epoch"] = str(num_train_epochs)
         metadata["ss_training_finished_at"] = str(time.time())

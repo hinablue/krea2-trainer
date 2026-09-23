@@ -140,6 +140,7 @@ def run_fixture(mode, directory, encoding="varlen"):
         "--output_name",
         "fixture",
         "--save_state",
+        "--profile_steps", "1", "--profile_warmup_steps", "0",
     ]
     if mode == "tqd":
         for flag in ("--post_training", "--preference_manifest", "--preference_batch_size", "--reference_lora"):
@@ -210,6 +211,17 @@ def run_fixture(mode, directory, encoding="varlen"):
         patch.object(sys, "argv", ["krea2-train-lora", *cli_args]),
     ):
         training_main()
+    profile = json.loads((output / "training-profile.json").read_text())
+    if not profile["complete"] or profile["collected_microsteps"] != 1:
+        raise AssertionError("Bounded profiling failed in the real training loop")
+    row = profile["steps"][0]
+    if row["cuda_stream_ms"] is not None or row["optimizer_updated"] != (mode != "flow_cpo"):
+        raise AssertionError("CPU timing or accumulated optimizer-step metadata is incorrect")
+    required = {"input_preparation", "process_batch", "backward", "optimizer", "post_optimizer_hook", "logging"}
+    if mode in ("flow_cpo", "flow_dpo"):
+        required.update(("old_forward" if mode == "flow_cpo" else "reference_forward", "policy_forward"))
+    if not required.issubset(row["phases"]):
+        raise AssertionError("Missing integrated profile phases")
     saved = output / "fixture.safetensors"
     if not saved.is_file():
         raise AssertionError("Full trainer failed to write final incremental checkpoint")

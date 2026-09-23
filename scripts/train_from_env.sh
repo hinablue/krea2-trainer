@@ -36,7 +36,15 @@ SAVE_EVERY_N_EPOCHS="${SAVE_EVERY_N_EPOCHS:-1}"
 NUM_CPU_THREADS_PER_PROCESS="${NUM_CPU_THREADS_PER_PROCESS:-1}"
 MAX_DATA_LOADER_N_WORKERS="${MAX_DATA_LOADER_N_WORKERS:-4}"
 SEED="${SEED:-17415}"
-ENABLE_COMPILE="${ENABLE_COMPILE:-0}"
+# Fresh LoRA/TQD only: an opt-in measured throughput recipe, not a change to
+# completed post-training modes or the optimizer/loss/batch-size recipe.
+TRAIN_PERFORMANCE="${TRAIN_PERFORMANCE:-balanced}"
+case "${TRAIN_PERFORMANCE}" in
+  balanced) compile_default=0 ;;
+  throughput) compile_default=1 ;;
+  *) echo "[ERROR] TRAIN_PERFORMANCE must be balanced or throughput" >&2; exit 2 ;;
+esac
+ENABLE_COMPILE="${ENABLE_COMPILE:-${compile_default}}"
 ENABLE_FP8="${ENABLE_FP8:-0}"
 COMPILE_MODE="${COMPILE_MODE:-max-autotune-no-cudagraphs}"
 COMPILE_DYNAMIC="${COMPILE_DYNAMIC:-auto}"
@@ -50,6 +58,33 @@ case "${TRAIN_MODE}" in standard|tqd) ;; *) echo "[ERROR] TRAIN_MODE must be sta
 case "${CACHE_MODE}" in all|latents|text|none) ;; *) echo "[ERROR] CACHE_MODE must be all, latents, text, or none" >&2; exit 2;; esac
 if [[ "${CACHE_SKIP_EXISTING}" == "1" && "${FORCE_REBUILD_CACHE}" == "1" ]]; then
   echo "[ERROR] CACHE_SKIP_EXISTING and FORCE_REBUILD_CACHE are mutually exclusive" >&2; exit 2
+fi
+
+# An explicit step cap must not be overwritten by the launcher's epoch default.
+# Direct Python CLI semantics remain unchanged; contradictory explicit launcher
+# CLI limits fail before cache/model work rather than silently choosing one.
+cli_step_limit=0
+cli_epoch_limit=0
+for argument in "$@"; do
+  case "${argument}" in
+    --max_train_steps|--max_train_steps=*) cli_step_limit=1 ;;
+    --max_train_epochs|--max_train_epochs=*) cli_epoch_limit=1 ;;
+    --*)
+      option="${argument%%=*}"
+      if [[ "--max_train_steps" == "${option}"* || "--max_train_epochs" == "${option}"* ]]; then
+        echo "[ERROR] Use full option names --max_train_steps / --max_train_epochs; abbreviated limits are unsupported by this launcher." >&2
+        exit 2
+      fi
+      ;;
+  esac
+done
+if [[ "${cli_epoch_limit}" == 1 && ( "${cli_step_limit}" == 1 || -n "${MAX_TRAIN_STEPS:-}" ) ]]; then
+  echo "[ERROR] Choose an explicit step cap or --max_train_epochs, not both." >&2
+  exit 2
+fi
+if [[ -n "${MAX_TRAIN_STEPS:-}" && ! "${MAX_TRAIN_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[ERROR] MAX_TRAIN_STEPS must be a positive integer." >&2
+  exit 2
 fi
 
 require_file() { [[ -f "$1" ]] || { echo "[ERROR] Missing $2: $1" >&2; exit 1; }; }
@@ -93,7 +128,7 @@ TRAIN_ARGS=(
   --network_dim 32 --network_alpha 16 --disable_numpy_memmap
   --learning_rate 5e-5 --lr_scheduler constant_with_warmup
   --optimizer_type Adopt_adv --optimizer_args cautious_wd=true kourkoutas_beta=true use_atan2=true weight_decay=0.01
-  --max_train_epochs "${MAX_TRAIN_EPOCHS}" --save_every_n_epochs "${SAVE_EVERY_N_EPOCHS}"
+  --save_every_n_epochs "${SAVE_EVERY_N_EPOCHS}"
   --output_dir "${OUTPUT_DIR}" --output_name "${OUTPUT_NAME}" --logging_dir "${LOGGING_DIR}"
   --seed "${SEED}" --max_data_loader_n_workers "${MAX_DATA_LOADER_N_WORKERS}"
   --persistent_data_loader_workers --cuda_allow_tf32 --cuda_cudnn_benchmark
@@ -114,12 +149,17 @@ if [[ -n "${LOG_WITH}" ]]; then
   TRAIN_ARGS+=(--log_prefix "${LOG_PREFIX}" --log_with "${LOG_WITH}" --log_config --log_tracker_name "${LOG_TRACKER_NAME}" --wandb_run_name "${WANDB_RUN_NAME}")
 fi
 if [[ "${ENABLE_COMPILE}" == 1 ]]; then
+  export TORCHINDUCTOR_COMPILE_THREADS="${TORCHINDUCTOR_COMPILE_THREADS:-2}"
   TRAIN_ARGS+=(--compile --compile_mode "${COMPILE_MODE}" --compile_dynamic "${COMPILE_DYNAMIC}" --compile_cache_size_limit "${COMPILE_CACHE_SIZE_LIMIT}")
 fi
+printf '[INFO] Fresh training profile defaults: performance=%s compile=%s mode=%s dynamic=%s fp8=%s; gradient checkpointing retained; extra CLI overrides follow.\n' \
+  "${TRAIN_PERFORMANCE}" "${ENABLE_COMPILE}" "${COMPILE_MODE}" "${COMPILE_DYNAMIC}" "${ENABLE_FP8}"
 # WANDB_API_KEY stays in the process environment; never copy secrets into argv or logs.
 
 if [[ -n "${MAX_TRAIN_STEPS:-}" ]]; then
   TRAIN_ARGS+=(--max_train_steps "${MAX_TRAIN_STEPS}")
+elif [[ "${cli_step_limit}" == 0 ]]; then
+  TRAIN_ARGS+=(--max_train_epochs "${MAX_TRAIN_EPOCHS}")
 fi
 
 if [[ "${ENABLE_FP8}" == 1 ]]; then

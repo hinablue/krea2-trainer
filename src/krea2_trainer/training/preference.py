@@ -14,6 +14,9 @@ import os
 from pathlib import Path
 
 import torch
+
+from krea2_trainer.training.metrics import materialize_metrics
+from krea2_trainer.utils.tensor_checks import all_finite
 import torch.nn.functional as F
 import toml
 
@@ -296,7 +299,9 @@ def per_image_mse(prediction, target):
     return mse
 
 
-def flow_dpo_loss(policy_chosen, policy_rejected, reference_chosen, reference_rejected, beta):
+def flow_dpo_loss(
+    policy_chosen, policy_rejected, reference_chosen, reference_rejected, beta, *, collect_metrics=True, metrics_as_tensors=False
+):
     """Return (pair-mean loss, metrics) for four vectors of per-image MSE.
 
     logit = beta/2 * [(e_policy_l - stopgrad(e_ref_l))
@@ -308,7 +313,7 @@ def flow_dpo_loss(policy_chosen, policy_rejected, reference_chosen, reference_re
     values = (policy_chosen, policy_rejected, reference_chosen, reference_rejected)
     if any(value.ndim != 1 or value.shape != policy_chosen.shape for value in values) or not policy_chosen.numel():
         raise ValueError("FlowDPO MSE inputs must have identical nonempty [pairs] shapes")
-    if any(not torch.isfinite(value).all() for value in values):
+    if not all_finite(values):
         raise FloatingPointError("All four FlowDPO MSE branches must be finite")
     chosen = policy_chosen.float() - reference_chosen.detach().float()
     rejected = policy_rejected.float() - reference_rejected.detach().float()
@@ -317,16 +322,18 @@ def flow_dpo_loss(policy_chosen, policy_rejected, reference_chosen, reference_re
     if not torch.isfinite(logits).all():
         raise FloatingPointError("Non-finite FlowDPO logit")
     loss = -F.logsigmoid(logits).mean()
+    if not collect_metrics:
+        return loss, {}
     metrics = {
-        "flow_dpo/loss": loss.detach().item(),
-        "flow_dpo/chosen_mse": policy_chosen.detach().float().mean().item(),
-        "flow_dpo/rejected_mse": policy_rejected.detach().float().mean().item(),
-        "flow_dpo/reference_chosen_mse": reference_chosen.detach().float().mean().item(),
-        "flow_dpo/reference_rejected_mse": reference_rejected.detach().float().mean().item(),
-        "flow_dpo/margin": margin.detach().mean().item(),
-        "flow_dpo/win_rate": (margin.detach() > 0).float().mean().item(),
+        "flow_dpo/loss": loss.detach(),
+        "flow_dpo/chosen_mse": policy_chosen.detach().float().mean(),
+        "flow_dpo/rejected_mse": policy_rejected.detach().float().mean(),
+        "flow_dpo/reference_chosen_mse": reference_chosen.detach().float().mean(),
+        "flow_dpo/reference_rejected_mse": reference_rejected.detach().float().mean(),
+        "flow_dpo/margin": margin.detach().mean(),
+        "flow_dpo/win_rate": (margin.detach() > 0).float().mean(),
     }
-    return loss, metrics
+    return loss, metrics if metrics_as_tensors else materialize_metrics(metrics)
 
 
 @contextmanager

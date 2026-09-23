@@ -705,13 +705,15 @@ class FlowCPOTrainerTests(unittest.TestCase):
         return args, model, trainer, network
 
     @staticmethod
-    def run_batch(args, model, trainer, network, batch=None):
+    def run_batch(args, model, trainer, network, batch=None, *, trackers=()):
         from tests.test_post_training import toy_accelerator, toy_batch
 
         batch = toy_batch() if batch is None else batch
+        accelerator = toy_accelerator()
+        accelerator.trackers = trackers
         return trainer.process_batch(
             args,
-            toy_accelerator(),
+            accelerator,
             model,
             network,
             batch,
@@ -744,7 +746,7 @@ class FlowCPOTrainerTests(unittest.TestCase):
         with old_adapter_context(network, trainer.ema_network, model):
             torch.testing.assert_close(model.first(probe), fixed, rtol=0, atol=0)
         with patch("torch.rand", return_value=torch.tensor([0.2, 0.8])):
-            loss, metrics = self.run_batch(args, model, trainer, network)
+            loss, metrics = self.run_batch(args, model, trainer, network, trackers=(object(),))
         old_call, policy_call = model.calls
         self.assertFalse(old_call["grad_enabled"])
         self.assertFalse(old_call["training"])

@@ -22,6 +22,8 @@ Krea2 Trainer 是從 [`kohya-ss/musubi-tuner`](https://github.com/kohya-ss/musub
 - **環境與追蹤**：[W&B logging](#wb-logging)、[容器訓練](#容器訓練)、[疑難排解](#疑難排解)。
 - **驗證範圍**：[RFT／FlowDPO 驗證](docs/post-training-verification.md)、[FlowCPO 驗證](docs/flow-cpo-verification.md)。
 - **計算優化**：[CPO／TQD 優化項目、相容性與數值驗證](docs/training-compute-optimizations.md)。
+- **新 LoRA／TQD 加速**：[throughput 模式、完整 RAW 模型短測與使用方法](docs/fresh-training-throughput.md)。
+- **吞吐量測與第一輪改善**：[step cap、DPO 去重、profiler 與小型 GPU A/B](docs/training-throughput-round1.md)。
 
 ## 訓練模式
 

@@ -785,6 +785,8 @@ def main():
 
     args = parser.parse_args()
     args = read_config_from_file(args, parser)
+    from krea2_trainer.training.profiling import validate_profile_args
+    validate_profile_args(args)
     validate_post_training_args(args)
     args = apply_krea2_preset(args)
 

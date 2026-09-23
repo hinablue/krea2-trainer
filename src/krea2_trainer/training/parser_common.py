@@ -12,6 +12,7 @@ import pathlib
 
 import toml
 from accelerate.utils import DynamoBackend
+from krea2_trainer.training.profiling import nonnegative_int
 
 
 logger = logging.getLogger(__name__)
@@ -161,6 +162,12 @@ def _add_compile_and_dynamo_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_training_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--profile_steps", type=nonnegative_int, default=0,
+                        help="Opt-in synchronized diagnostic microsteps; 0 disables profiling. Does not limit training.")
+    parser.add_argument("--profile_warmup_steps", type=nonnegative_int, default=5,
+                        help="Unprofiled microsteps before the bounded diagnostic window (default 5).")
+    parser.add_argument("--profile_output", type=str, default=None,
+                        help="Profile JSON path; default output_dir/training-profile.json (rank suffix for DDP).")
     parser.add_argument("--max_train_steps", type=int, default=1600, help="training steps / 学習ステップ数")
     parser.add_argument(
         "--max_train_epochs",

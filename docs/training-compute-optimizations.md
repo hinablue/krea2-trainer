@@ -1,5 +1,7 @@
 # CPO／TQD 計算優化
 
+後續的 step cap、DPO paired conditioning、metrics 與分階段 profiler，見 [Throughput 第一輪](training-throughput-round1.md)；其中的小模型 GPU 數字不是正式模型的吞吐保證。
+
 2026-09-12 實作。沿用現有訓練命令，沒有調整 learning rate、rank、loss 係數、EMA decay 或 batch size。GQA 仍使用原本 K/V `repeat_interleave`＋SDPA，沒有啟用原生 GQA 或改動 SDPA 呼叫。
 
 ## CPO 1～5
